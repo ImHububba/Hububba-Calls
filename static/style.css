@@ -59,6 +59,10 @@ button.danger{border-color:#7a2b28; background:#2a1414; color:#ffd6d4}
   position:absolute; left:10px; bottom:10px; padding:4px 8px; border-radius:8px;
   background:rgba(0,0,0,.5); color:#fff; font-weight:600; font-size:12px;
 }
+.name-label .op{
+  display:inline-block; margin-left:6px; padding:2px 6px; border-radius:6px;
+  background:var(--danger); color:#fff; font-weight:800; font-size:11px;
+}
 .peer .kick{
   position:absolute; right:8px; top:8px;
   background:#2a1414; color:#ffd6d4; border:1px solid #7a2b28; border-radius:8px; padding:4px 8px; cursor:pointer; font-size:12px;
