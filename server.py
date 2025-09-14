@@ -1,8 +1,14 @@
 import os
 import time
 import threading
-from flask import Flask, send_from_directory, request
+from urllib.parse import urlparse
+
+from flask import Flask, send_from_directory, request, jsonify
 from flask_socketio import SocketIO, emit, join_room, leave_room
+
+# NEW: for embed fetching
+import requests
+from bs4 import BeautifulSoup
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 app = Flask(
@@ -15,24 +21,19 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev")
 allowed = os.environ.get("ALLOWED_ORIGINS", "*")
 socketio = SocketIO(app, cors_allowed_origins=allowed, async_mode="eventlet")
 
-# Tunables (override via env if you want)
-GRACE_SECONDS  = int(os.environ.get("DISCONNECT_GRACE_SECONDS", "5"))   # remove after brief tab close
-STALE_SECONDS  = int(os.environ.get("DUPLICATE_STALE_SECONDS", "2"))    # consider duplicate "ghost" if > this
-CHAT_MAX       = int(os.environ.get("CHAT_MAX", "200"))                 # per-room chat history cap
-CHAT_TRIM_TO   = int(os.environ.get("CHAT_TRIM_TO", "160"))             # trim down to this when exceeding
+# Tunables
+GRACE_SECONDS  = int(os.environ.get("DISCONNECT_GRACE_SECONDS", "5"))
+STALE_SECONDS  = int(os.environ.get("DUPLICATE_STALE_SECONDS", "2"))
+CHAT_MAX       = int(os.environ.get("CHAT_MAX", "200"))
+CHAT_TRIM_TO   = int(os.environ.get("CHAT_TRIM_TO", "160"))
+
+# ---- Simple embed cache ----
+EMBED_CACHE = {}
+EMBED_TTL   = int(os.environ.get("EMBED_TTL", "600"))  # 10 minutes
 
 # -------------------------------------------------------------------
 # In-memory room state
 # -------------------------------------------------------------------
-# rooms = {
-#   room: {
-#       "created": ts,
-#       "owner": "name" | None,
-#       "users": { name: {"sid":sid, "last_seen":ts, "joined_at":ts} },
-#       "chat": [ { "ts": ts, "type": "system"|"user", "user": "name"|None, "text": str } ]
-#   }
-# }
-# sid_index = { sid: {"room": room, "user": name} }
 rooms = {}
 sid_index = {}
 
@@ -88,18 +89,14 @@ def emit_rooms_update():
     socketio.emit("rooms_update", rooms_snapshot())
 
 def transfer_owner_if_needed(room: str):
-    """If room has no valid owner, promote the earliest joined remaining user."""
     if room not in rooms: return
     v = rooms[room]
     owner = v.get("owner")
-    # Owner still valid?
-    if owner and owner in v["users"]:
+    if owner and owner in v["users"]:  # still valid
         return
-    # No users? keep None; room might be deleted by caller later
     if not v["users"]:
         v["owner"] = None
         return
-    # Promote earliest joined
     next_owner = min(v["users"].items(), key=lambda kv: kv[1].get("joined_at", now()))[0]
     v["owner"] = next_owner
     socketio.emit("owner_changed", {"room": room, "owner": next_owner}, to=room)
@@ -113,12 +110,10 @@ def is_admin_sid(sid: str) -> bool:
 
 # ---------------- Chat helpers ----------------
 def add_chat(room: str, mtype: str, user: str | None, text: str):
-    """Append a chat message and trim."""
     if room not in rooms: return
     text = (text or "")[:500]
     msg = {"ts": int(now()), "type": mtype, "user": user, "text": text, "room": room}
     rooms[room]["chat"].append(msg)
-    # Trim if too big
     if len(rooms[room]["chat"]) > CHAT_MAX:
         rooms[room]["chat"] = rooms[room]["chat"][-CHAT_TRIM_TO:]
     return msg
@@ -132,6 +127,90 @@ def index():
 
 @app.route("/health")
 def health(): return "OK", 200
+
+# ---------- NEW: embed preview endpoint ----------
+@app.get("/embed")
+def embed_preview():
+    """Return metadata for imhububba links to render chat embeds."""
+    url = (request.args.get("url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "missing_url"}), 400
+
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return jsonify({"ok": False, "error": "bad_scheme"}), 400
+        host = (p.hostname or "").lower()
+        # Restrict to Hububba host(s)
+        if not (host.endswith("i.imhububba.com") or host.endswith("imhububba.com")):
+            return jsonify({"ok": False, "error": "domain_not_allowed"}), 403
+
+        cached = EMBED_CACHE.get(url)
+        if cached and (now() - cached["_ts"] < EMBED_TTL):
+            payload = cached.copy(); payload.pop("_ts", None)
+            return jsonify({"ok": True, **payload})
+
+        sess = requests.Session()
+        sess.headers.update({"User-Agent": "HububbaCalls-Embed/1.0"})
+        meta = {"source": url, "domain": host}
+
+        # Try HEAD first (for direct images)
+        try:
+            h = sess.head(url, timeout=4, allow_redirects=True)
+        except Exception:
+            h = None
+
+        if h is not None:
+            ct = (h.headers.get("content-type") or "").split(";")[0].strip()
+            cl = h.headers.get("content-length")
+            size = None
+            try:
+                size = int(cl) if cl and cl.isdigit() else None
+            except Exception:
+                size = None
+
+            meta.update({"content_type": ct, "bytes": size})
+
+            if ct.startswith("image/"):
+                # Direct image link; we can embed immediately
+                meta.update({
+                    "type": "image",
+                    "title": os.path.basename(p.path) or "Image",
+                    "image": url
+                })
+                EMBED_CACHE[url] = {**meta, "_ts": now()}
+                return jsonify({"ok": True, **meta})
+
+        # Otherwise fetch HTML & read OpenGraph
+        try:
+            r = sess.get(url, timeout=6)
+            html = r.text[:200_000]
+            soup = BeautifulSoup(html, "html.parser")
+
+            def og(key):
+                tag = soup.find("meta", property=f"og:{key}") or soup.find("meta", attrs={"name": f"og:{key}"})
+                return (tag.get("content") or "").strip() if tag else None
+
+            title = og("title") or (soup.title.string.strip() if soup.title and soup.title.string else None)
+            desc  = og("description")
+            image = og("image")
+            site  = og("site_name")
+
+            meta.update({
+                "type": "html",
+                "title": title,
+                "description": desc,
+                "image": image,
+                "site_name": site
+            })
+        except Exception:
+            meta.update({"type": "unknown"})
+
+        EMBED_CACHE[url] = {**meta, "_ts": now()}
+        return jsonify({"ok": True, **meta})
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": "exception", "detail": str(e)}), 500
 
 # -------------------------------------------------------------------
 # Socket.IO
@@ -167,7 +246,6 @@ def on_join(data):
 
     if existing and existing["sid"] != request.sid:
         age = now() - existing["last_seen"]
-        # Fast path: auto-evict ghosts or force-takeover
         if age >= STALE_SECONDS or force:
             try:
                 emit("kicked", {"room": room, "by": "system", "reason": "name_taken"}, to=existing["sid"])
@@ -185,16 +263,13 @@ def on_join(data):
     join_room(room)
     mark_seen(room, user, request.sid)
 
-    # Make first joiner the owner
     if was_empty or rooms[room].get("owner") is None:
         rooms[room]["owner"] = user
         socketio.emit("owner_changed", {"room": room, "owner": user}, to=room)
 
-    # announce join
     sysmsg = add_chat(room, "system", None, f"{user} joined")
     if sysmsg: socketio.emit("chat_message", sysmsg, to=room)
 
-    # start mesh for others
     socketio.emit("ready", {"user": user}, to=room, skip_sid=request.sid)
 
     emit("joined", {
@@ -208,7 +283,6 @@ def on_join(data):
 
 @socketio.on("kick_user")
 def on_kick_user(data):
-    """Owner-only kick within the same room."""
     sid = request.sid
     meta = sid_index.get(sid)
     room = (data or {}).get("room", "").strip()
@@ -229,7 +303,6 @@ def on_kick_user(data):
     if not ex:
         emit("kick_result", {"ok": False, "msg": "User not found"}); return
 
-    # Notify the target and disconnect
     try:
         emit("kicked", {"room": room, "by": meta["user"], "reason": "admin"}, to=ex["sid"])
     except Exception:
@@ -239,7 +312,6 @@ def on_kick_user(data):
     transfer_owner_if_needed(room)
     emit_rooms_update()
     socketio.emit("peer_left", {"user": target}, to=room)
-    # announce
     sysmsg = add_chat(room, "system", None, f"{target} was kicked by {meta['user']}")
     if sysmsg: socketio.emit("chat_message", sysmsg, to=room)
     emit("kick_result", {"ok": True, "target": target})
@@ -263,7 +335,6 @@ def on_disconnect():
     sid = request.sid
     meta = sid_index.get(sid)
     if not meta: return
-    # update last seen then schedule cleanup
     mark_seen(meta["room"], meta["user"], sid)
     def cleanup(s):
         time.sleep(GRACE_SECONDS)
@@ -280,7 +351,6 @@ def on_disconnect():
             if sysmsg: socketio.emit("chat_message", sysmsg, to=r)
     threading.Thread(target=cleanup, args=(sid,), daemon=True).start()
 
-# ---- WebRTC signaling routed by room+username ---------------------------
 def _sid_for(room: str, name: str) -> str | None:
     u = rooms.get(room, {}).get("users", {}).get(name)
     return None if not u else u["sid"]
@@ -303,7 +373,6 @@ def on_webrtc_ice(data):
     sid = _sid_for(room, to) if room and to else None
     if sid: emit("webrtc-ice-candidate", data, to=sid)
 
-# ---- Screenshare state (UI hint) -----------------------------------------
 @socketio.on("screenshare_state")
 def on_screenshare_state(data):
     room = (data or {}).get("room", "").strip()
