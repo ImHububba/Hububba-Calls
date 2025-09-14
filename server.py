@@ -15,16 +15,19 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev")
 allowed = os.environ.get("ALLOWED_ORIGINS", "*")
 socketio = SocketIO(app, cors_allowed_origins=allowed, async_mode="eventlet")
 
-# Tunables (can be overridden via Railway/ENV)
+# Tunables (override via env if you want)
 GRACE_SECONDS  = int(os.environ.get("DISCONNECT_GRACE_SECONDS", "5"))  # remove after brief tab close
 STALE_SECONDS  = int(os.environ.get("DUPLICATE_STALE_SECONDS", "2"))   # consider duplicate "ghost" if > this
-ADMIN_NAME     = os.environ.get("ADMIN_NAME", "hububba").lower()       # admin username (case-insensitive)
 
 # -------------------------------------------------------------------
 # In-memory room state
 # -------------------------------------------------------------------
 # rooms = {
-#   room: { "created": ts, "users": { name: {"sid":sid, "last_seen":ts} } }
+#   room: {
+#       "created": ts,
+#       "owner": "name" | None,
+#       "users": { name: {"sid":sid, "last_seen":ts, "joined_at":ts} }
+#   }
 # }
 # sid_index = { sid: {"room": room, "user": name} }
 rooms = {}
@@ -34,11 +37,17 @@ def now() -> float: return time.time()
 
 def ensure_room(room: str):
     if room not in rooms:
-        rooms[room] = {"created": now(), "users": {}}
+        rooms[room] = {"created": now(), "owner": None, "users": {}}
 
 def mark_seen(room: str, user: str, sid: str):
     ensure_room(room)
-    rooms[room]["users"][user] = {"sid": sid, "last_seen": now()}
+    cur = rooms[room]["users"].get(user)
+    t = now()
+    if not cur or cur.get("sid") != sid:
+        rooms[room]["users"][user] = {"sid": sid, "last_seen": t, "joined_at": t}
+    else:
+        cur["last_seen"] = t
+        cur["sid"] = sid
     sid_index[sid] = {"room": room, "user": user}
 
 def remove_user(room: str, user: str, expect_sid: str | None = None):
@@ -47,7 +56,7 @@ def remove_user(room: str, user: str, expect_sid: str | None = None):
     if not u: return
     if expect_sid and u["sid"] != expect_sid: return
     rooms[room]["users"].pop(user, None)
-    # clean sid_index entries for that (room,user)
+    # clean sid index entries for that (room,user)
     for sid, meta in list(sid_index.items()):
         if meta["room"] == room and meta["user"] == user:
             sid_index.pop(sid, None)
@@ -64,15 +73,39 @@ def rooms_snapshot():
     t = now()
     out = []
     for r, v in rooms.items():
-        out.append({"name": r, "users": sorted(v["users"].keys()), "elapsed": int(t - v["created"])})
+        out.append({
+            "name": r,
+            "users": sorted(v["users"].keys()),
+            "elapsed": int(t - v["created"]),
+            "owner": v.get("owner")
+        })
     return sorted(out, key=lambda x: x["name"].lower())
 
 def emit_rooms_update():
     socketio.emit("rooms_update", rooms_snapshot())
 
+def transfer_owner_if_needed(room: str):
+    """If room has no valid owner, promote the earliest joined remaining user."""
+    if room not in rooms: return
+    v = rooms[room]
+    owner = v.get("owner")
+    # Owner still valid?
+    if owner and owner in v["users"]:
+        return
+    # No users? keep None; room might be deleted by caller later
+    if not v["users"]:
+        v["owner"] = None
+        return
+    # Promote earliest joined
+    next_owner = min(v["users"].items(), key=lambda kv: kv[1].get("joined_at", now()))[0]
+    v["owner"] = next_owner
+    socketio.emit("owner_changed", {"room": room, "owner": next_owner}, to=room)
+
 def is_admin_sid(sid: str) -> bool:
     meta = sid_index.get(sid)
-    return bool(meta and str(meta["user"]).lower() == ADMIN_NAME)
+    if not meta: return False
+    room, user = meta["room"], meta["user"]
+    return rooms.get(room, {}).get("owner") == user
 
 # -------------------------------------------------------------------
 # HTTP
@@ -118,36 +151,43 @@ def on_join(data):
 
     if existing and existing["sid"] != request.sid:
         age = now() - existing["last_seen"]
-        # Fast path: auto-evict ghosts
+        # Fast path: auto-evict ghosts or force-takeover
         if age >= STALE_SECONDS or force:
-            safe_disconnect(existing["sid"])
-            remove_user(room, user, expect_sid=existing["sid"])
-            # Tell the old holder they were kicked (if still connected)
             try:
                 emit("kicked", {"room": room, "by": "system", "reason": "name_taken"}, to=existing["sid"])
             except Exception:
                 pass
+            safe_disconnect(existing["sid"])
+            remove_user(room, user, expect_sid=existing["sid"])
             emit_rooms_update()
         else:
             emit("join_conflict", {"room": room, "user": user, "msg": "That name is already in this room"})
             return
 
+    was_empty = (len(rooms[room]["users"]) == 0)
+
     join_room(room)
     mark_seen(room, user, request.sid)
 
-    # start mesh
+    # Make first joiner the owner
+    if was_empty or rooms[room].get("owner") is None:
+        rooms[room]["owner"] = user
+        socketio.emit("owner_changed", {"room": room, "owner": user}, to=room)
+
+    # start mesh for others
     socketio.emit("ready", {"user": user}, to=room, skip_sid=request.sid)
 
     emit("joined", {
         "room": room,
         "created": rooms[room]["created"],
-        "users": sorted(list(rooms[room]["users"].keys()))
+        "users": sorted(list(rooms[room]["users"].keys())),
+        "owner": rooms[room]["owner"]
     })
     emit_rooms_update()
 
 @socketio.on("kick_user")
 def on_kick_user(data):
-    """Admin-only kick within the same room."""
+    """Owner-only kick within the same room."""
     sid = request.sid
     meta = sid_index.get(sid)
     room = (data or {}).get("room", "").strip()
@@ -161,6 +201,8 @@ def on_kick_user(data):
         emit("kick_result", {"ok": False, "msg": "Wrong room"}); return
     if not is_admin_sid(sid):
         emit("kick_result", {"ok": False, "msg": "Not authorized"}); return
+    if target == meta["user"]:
+        emit("kick_result", {"ok": False, "msg": "Cannot kick yourself"}); return
 
     ex = rooms.get(room, {}).get("users", {}).get(target)
     if not ex:
@@ -173,6 +215,7 @@ def on_kick_user(data):
         pass
     safe_disconnect(ex["sid"])
     remove_user(room, target, expect_sid=ex["sid"])
+    transfer_owner_if_needed(room)
     emit_rooms_update()
     socketio.emit("peer_left", {"user": target}, to=room)
     emit("kick_result", {"ok": True, "target": target})
@@ -185,6 +228,7 @@ def on_leave(_data):
     room, user = meta["room"], meta["user"]
     leave_room(room)
     remove_user(room, user, expect_sid=sid)
+    transfer_owner_if_needed(room)
     emit_rooms_update()
     socketio.emit("peer_left", {"user": user}, to=room)
 
@@ -193,6 +237,7 @@ def on_disconnect():
     sid = request.sid
     meta = sid_index.get(sid)
     if not meta: return
+    # update last seen then schedule cleanup
     mark_seen(meta["room"], meta["user"], sid)
     def cleanup(s):
         time.sleep(GRACE_SECONDS)
@@ -202,6 +247,7 @@ def on_disconnect():
         current = rooms.get(r, {}).get("users", {}).get(u)
         if current and now() - current["last_seen"] >= GRACE_SECONDS:
             remove_user(r, u, expect_sid=current["sid"])
+            transfer_owner_if_needed(r)
             emit_rooms_update()
             socketio.emit("peer_left", {"user": u}, to=r)
     threading.Thread(target=cleanup, args=(sid,), daemon=True).start()
