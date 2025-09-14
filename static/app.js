@@ -46,7 +46,6 @@ let screenActive = false;
 const rtcConfig = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
 
 // Map of remote user -> peerConnection & helpers
-// peers.get(username) => { pc, makingOffer, ignoreOffer, polite, screenSenders:Set<RTCRtpSender>, cameraStreamId }
 const peers = new Map();
 
 // Tiles: displayName -> { wrap, video, label, stopVAD? }
@@ -97,7 +96,7 @@ function refreshKickButtons(){
     const isScreen = name.endsWith(" (Sharing Screen)");
     const pure = name.replace(" (Sharing Screen)","");
     let btn = tile.wrap.querySelector("button.kick");
-    const shouldShow = isAdmin() && pure !== myName && !isScreen; // don't show on screen tiles
+    const shouldShow = isAdmin() && pure !== myName && !isScreen;
     if (shouldShow){
       if (!btn){
         btn = document.createElement("button");
@@ -200,18 +199,14 @@ elLeave.addEventListener("click", ()=> {
 });
 
 function cleanupAfterLeave(){
-  // close PCs
   for (const p of peers.values()){ try{ p.pc.close(); }catch{} }
   peers.clear();
-  // remove all tiles except local preview "You"
   for (const name of Array.from(tiles.keys())){
     if (name !== "You") removeTile(name);
   }
-  // reset self
   myRoom=""; currentOwner=""; elRoomTitle.textContent="No room"; elTimer.textContent="";
   if (timerHandle){ clearInterval(timerHandle); timerHandle=null; }
   updateButtonsJoined(false); myName="";
-  // set preview tile label back
   if (tiles.has("You")) applyOpBadge(tiles.get("You").label, false);
   elConflictRow && (elConflictRow.style.display = "none");
   chatEl.innerHTML="";
@@ -230,19 +225,15 @@ elShare.addEventListener("click", async ()=>{
       screenStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:false });
       const screenTrack = screenStream.getVideoTracks()[0];
 
-      // local tile for screen
       const screenName = `${myName} (Sharing Screen)`;
       const tile = ensureTile(screenName);
       tile.video.srcObject = screenStream;
 
-      // add track to each pc (separate sender, not replacing camera)
       for (const [peerName, peer] of peers.entries()){
         const sender = peer.pc.addTrack(screenTrack, screenStream);
         if (!peer.screenSenders) peer.screenSenders = new Set();
         peer.screenSenders.add(sender);
       }
-      // negotiate (perfect negotiation handles offer)
-      // when screen ends
       screenTrack.addEventListener("ended", stopScreenShare);
       screenActive = true; elShare.textContent = "Stop Share";
       socket.emit("screenshare_state", { room: myRoom, user: myName, active: true });
@@ -255,7 +246,6 @@ elShare.addEventListener("click", async ()=>{
 function stopScreenShare(){
   if (!screenActive) return;
   try{ screenStream.getTracks().forEach(t=>t.stop()); }catch{}
-  // remove senders and renegotiate
   for (const peer of peers.values()){
     if (peer.screenSenders){
       for (const s of Array.from(peer.screenSenders)){ try{ peer.pc.removeTrack(s); }catch{} peer.screenSenders.delete(s); }
@@ -277,33 +267,25 @@ function makePC(forUser, initiator){
     pc,
     makingOffer:false,
     ignoreOffer:false,
-    polite: myName < forUser, // deterministic
+    polite: myName < forUser,
     screenSenders: new Set(),
     cameraStreamId: null
   };
   peers.set(forUser, info);
 
-  // local tracks (camera + mic)
   localStream?.getTracks().forEach(t=>pc.addTrack(t, localStream));
 
   pc.ontrack = (ev)=>{
-    // Determine whether this is the first video (camera) or extra (screen)
     const stream = ev.streams[0];
     if (ev.track.kind === "video"){
       if (!info.cameraStreamId){
-        // first video we see for this peer => camera
         info.cameraStreamId = stream.id;
         const camTile = ensureTile(forUser);
         if (camTile.video.srcObject !== stream) camTile.video.srcObject = stream;
       } else if (stream.id !== info.cameraStreamId) {
-        // second distinct stream => screenshare
         const scrTile = ensureTile(`${forUser} (Sharing Screen)`);
         if (scrTile.video.srcObject !== stream) scrTile.video.srcObject = stream;
-      } else {
-        // same stream, just another track event; ignore
       }
-    } else if (ev.track.kind === "audio"){
-      // nothing UI-wise; VAD from remote stream is handled below if wanted
     }
   };
 
@@ -321,7 +303,6 @@ function makePC(forUser, initiator){
     finally{ info.makingOffer = false; }
   };
 
-  // if we are the initial caller, kick off offer once tracks are added
   if (initiator){
     (async ()=>{
       try{
@@ -364,7 +345,7 @@ socket.on("webrtc-answer", async (data)=>{
 socket.on("webrtc-ice-candidate", async (data)=>{
   if (data.to!==myName || data.room!==myRoom) return;
   const pc = peers.get(data.from)?.pc; if(!pc) return;
-  try{ await pc.addIceCandidate(data.candidate); }catch(e){ /* ignore during glare */ }
+  try{ await pc.addIceCandidate(data.candidate); }catch(e){ /* ignore */ }
 });
 
 // presence
@@ -374,10 +355,8 @@ socket.on("ready", ({user})=>{
   if (!peer){ const pc = makePC(user,true); }
 });
 socket.on("peer_left", ({user})=>{
-  // remove both camera & possible screen tiles
   removeTile(user);
   removeTile(`${user} (Sharing Screen)`);
-  // close pc
   const p = peers.get(user);
   if (p){ try{ p.pc.close(); }catch{} peers.delete(user); }
 });
@@ -390,15 +369,13 @@ socket.on("joined", (data)=>{
   elRoomTitle.textContent = `Room: ${myRoom}`;
   setTimerStart(data.created);
 
-  // rename local preview tile from "You" -> myName
   if (tiles.has("You")) renameTile("You", myName);
 
-  // rebuild from server truth
   for (const name of Array.from(tiles.keys())){
     if (name !== myName) removeTile(name);
   }
   for (const u of data.users){
-    if (u !== myName) ensureTile(u); // peers will fill video ontrack
+    if (u !== myName) ensureTile(u);
   }
 
   updateButtonsJoined(true);
@@ -407,7 +384,6 @@ socket.on("joined", (data)=>{
 
   socket.emit("request_rooms");
 
-  // load chat history
   chatEl.innerHTML = "";
   (data.chat || []).forEach(renderChatMessage);
   scrollChatToBottom();
@@ -469,6 +445,10 @@ function renderChatMessage(m){
     meta.appendChild(nameEl); meta.appendChild(timeEl);
     const body = document.createElement("div"); body.textContent = m.text;
     bubble.appendChild(meta); bubble.appendChild(body);
+
+    // NEW: detect Hububba links and attach embed previews
+    const links = extractHububbaLinks(m.text);
+    links.forEach(url => addEmbed(bubble, url));
   }
   row.appendChild(bubble); chatEl.appendChild(row);
 }
@@ -484,7 +464,7 @@ function sendChat(){
 }
 socket.on("chat_message", (m)=>{ if (m.room && myRoom && m.room !== myRoom) return; renderChatMessage(m); scrollChatToBottom(); });
 
-// --------------------------- Screenshare UI hint (adds/removes remote screen tile quickly)
+// --------------------------- Screenshare UI hint
 socket.on("screenshare_state", ({room,user,active})=>{
   if (room !== myRoom) return;
   const screenName = `${user} (Sharing Screen)`;
@@ -527,3 +507,103 @@ shareCopy.addEventListener("click", async ()=>{
 
 // Initial
 socket.emit("request_rooms");
+
+/* =======================
+   EMBED HELPERS (NEW)
+   ======================= */
+
+function extractHububbaLinks(text){
+  if (!text) return [];
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  const all = Array.from(text.matchAll(urlRegex)).map(m=>m[1]);
+  return all.filter(u => {
+    try{
+      const host = new URL(u).hostname.toLowerCase();
+      return host.endsWith("i.imhububba.com") || host.endsWith("imhububba.com");
+    }catch{ return false; }
+  });
+}
+
+function humanBytes(b){
+  if (!Number.isFinite(b) || b <= 0) return null;
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0; let n = b;
+  while (n >= 1024 && i < units.length-1){ n/=1024; i++; }
+  return `${n.toFixed(n>=10?0:1)} ${units[i]}`;
+}
+
+function addEmbed(container, url){
+  const box = document.createElement("div");
+  box.className = "embed loading";
+  box.innerHTML = `
+    <div class="embed__row">
+      <div class="embed__media"></div>
+      <div class="embed__body">
+        <div class="embed__title mono">${url}</div>
+        <div class="embed__meta">Loading preview…</div>
+        <div class="embed__actions" style="display:none;"></div>
+      </div>
+    </div>
+  `;
+  container.appendChild(box);
+
+  fetch(`/embed?url=${encodeURIComponent(url)}`)
+    .then(r=>r.json())
+    .then(data=>{
+      box.classList.remove("loading");
+      const media = box.querySelector(".embed__media");
+      const title = box.querySelector(".embed__title");
+      const meta  = box.querySelector(".embed__meta");
+      const actions = box.querySelector(".embed__actions");
+
+      if (!data.ok){
+        title.textContent = url;
+        meta.textContent = "No preview available";
+        return;
+      }
+
+      // Default title
+      title.textContent = data.title || data.site_name || data.domain || "Preview";
+
+      // Media
+      media.innerHTML = "";
+      const showImg = data.image && typeof data.image === "string";
+      if (data.type === "image"){
+        const img = document.createElement("img");
+        img.src = data.image || data.source || url;
+        media.appendChild(img);
+        const sizeTxt = humanBytes(data.bytes);
+        meta.textContent = `Image${sizeTxt?` • ${sizeTxt}`:""} • ${data.content_type || ""}`.trim();
+      } else if (showImg){
+        const img = document.createElement("img");
+        img.src = data.image;
+        media.appendChild(img);
+        meta.textContent = data.site_name ? `${data.site_name} • ${data.domain}` : data.domain;
+        if (data.description){
+          const d = document.createElement("div");
+          d.className = "embed__desc";
+          d.textContent = data.description;
+          box.querySelector(".embed__body").appendChild(d);
+        }
+      } else {
+        meta.textContent = data.domain || new URL(url).hostname;
+      }
+
+      // Actions
+      actions.style.display = "flex";
+      const openBtn = document.createElement("button");
+      openBtn.textContent = "Open";
+      openBtn.addEventListener("click", ()=> window.open(url, "_blank", "noopener"));
+      const copyBtn = document.createElement("button");
+      copyBtn.textContent = "Copy Link";
+      copyBtn.addEventListener("click", async ()=> {
+        try{ await navigator.clipboard.writeText(url); toast("Link copied"); }catch{}
+      });
+      actions.appendChild(openBtn); actions.appendChild(copyBtn);
+    })
+    .catch(()=>{
+      box.classList.remove("loading");
+      const meta  = box.querySelector(".embed__meta");
+      meta.textContent = "Failed to load preview";
+    });
+}
