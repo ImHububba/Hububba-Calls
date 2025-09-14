@@ -123,3 +123,25 @@ button.danger{border-color:#7a2b28; background:#2a1414; color:#ffd6d4}
 
 .chat-input-row{display:flex; gap:8px; margin-top:8px}
 .chat-input-row input{flex:1}
+
+/* --- Chat Embeds --- */
+.embed {
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0f1720;
+  overflow: hidden;
+}
+.embed.loading { opacity: .7; }
+.embed__row { display: flex; gap: 10px; align-items: stretch; }
+.embed__media img {
+  display: block;
+  width: 140px; height: 100px; object-fit: cover; background: #000;
+}
+.embed__body { padding: 10px; flex: 1; min-width: 0; }
+.embed__title { margin: 0 0 4px 0; font-weight: 700; color: #dce8f6; }
+.embed__meta { color: #8ea4b9; font-size: 12px; }
+.embed__desc { color: #bcd0e5; font-size: 13px; margin-top: 4px; }
+.embed__actions { display: flex; gap: 8px; margin-top: 8px; }
+.embed .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+
