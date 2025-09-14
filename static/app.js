@@ -1,248 +1,310 @@
-// elements
-const displayNameEl = document.getElementById("displayName");
-const roomEl        = document.getElementById("room");
-const previewBtn    = document.getElementById("previewBtn");
-const joinBtn       = document.getElementById("joinBtn");
-const leaveBtn      = document.getElementById("leaveBtn");
-const muteBtn       = document.getElementById("muteBtn");
-const camBtn        = document.getElementById("camBtn");
-const screenBtn     = document.getElementById("screenBtn");
-const roomsListEl   = document.getElementById("roomsList");
-const participantsEl= document.getElementById("participants");
-const localVideo    = document.getElementById("localVideo");
-const statusbar     = document.getElementById("statusbar");
+// ---------------------------
+// Socket connection
+// ---------------------------
+const socket = io({ transports: ["websocket"] });
 
-// socket (same-origin Flask-SocketIO)
-const socket = io({ autoConnect:false });
+// ---------------------------
+// UI elements
+// ---------------------------
+const elName = document.getElementById("displayName");
+const elRoom = document.getElementById("roomInput");
+const elJoin = document.getElementById("btnJoin");
+const elLeave = document.getElementById("btnLeave");
+const elMute = document.getElementById("btnMute");
+const elCam  = document.getElementById("btnCam");
+const elShare= document.getElementById("btnShare");
+const elRooms= document.getElementById("roomsList");
+const elErr  = document.getElementById("errorBox");
 
-// rtc
-const rtcConfig = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
-const pcByPeer = new Map();
-let mySid=null, currentRoom=null, localStream=null, micEnabled=true, camEnabled=true;
+const elRoomTitle = document.getElementById("roomTitle");
+const elTimer = document.getElementById("roomTimer");
 
-// ---------- helpers ----------
-function showStatus(text, kind="info"){
-  const colors = { info:"#a9b2c2", ok:"#2bd27b", warn:"#ffb24e", error:"#ff6b6b" };
-  statusbar.textContent = text;
-  statusbar.style.color = colors[kind] || colors.info;
-  statusbar.style.display = "block";
+const localVideo = document.getElementById("localVideo");
+const meName = document.getElementById("meName");
+const peersGrid = document.getElementById("peers");
+
+let myName = "";
+let myRoom = "";
+let roomCreatedTs = 0;
+let timerHandle = null;
+
+let localStream = null;
+let screenStream = null;
+
+// peers: name -> { pc, videoEl }
+const peers = new Map();
+
+const rtcConfig = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" }
+    // Add TURN servers here later for strict NATs
+  ]
+};
+
+// ---------------------------
+// Helpers
+// ---------------------------
+const fmt = (s) => s == null ? "" : String(s).trim();
+const disable = (el, v) => el.disabled = !!v;
+
+function setTimerStart(ts) {
+  roomCreatedTs = ts;
+  if (timerHandle) clearInterval(timerHandle);
+  timerHandle = setInterval(() => {
+    const elapsed = Math.max(0, Math.floor(Date.now()/1000 - roomCreatedTs));
+    const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
+    const ss = String(elapsed % 60).padStart(2, "0");
+    elTimer.textContent = `• Live ${mm}:${ss}`;
+  }, 1000);
 }
-function uiJoined(joined){
-  joinBtn.disabled = joined; leaveBtn.disabled = !joined;
-  muteBtn.disabled = !localStream; camBtn.disabled = !localStream; screenBtn.disabled = !joined;
-  roomEl.disabled  = joined; displayNameEl.disabled = joined;
-  joinBtn.textContent = joined ? "Joined" : "Join";
-}
-function ensurePreviewButtons(){
-  const has = !!localStream;
-  previewBtn.textContent = has ? "Preview Ready" : "Enable Preview";
-  previewBtn.disabled = has;
-  muteBtn.disabled = !has;
-  camBtn.disabled = !has;
+
+function showError(msg) {
+  elErr.style.display = "block";
+  elErr.textContent = msg;
+  setTimeout(() => (elErr.style.display = "none"), 3500);
 }
 
-// ---------- media ----------
-async function startPreview(){
-  if (localStream) return;
-  try{
-    showStatus("Requesting camera & mic…");
-    // localhost is HTTPS-exempt; elsewhere use https
-    localStream = await navigator.mediaDevices.getUserMedia({ audio:true, video:true });
+function addPeerCard(name) {
+  if (peers.has(name)) return peers.get(name).videoEl;
+
+  const wrap = document.createElement("div");
+  wrap.className = "peer";
+  const v = document.createElement("video");
+  v.autoplay = true; v.playsInline = true;
+  const label = document.createElement("div");
+  label.className = "name-label";
+  label.textContent = name;
+
+  wrap.appendChild(v);
+  wrap.appendChild(label);
+  peersGrid.appendChild(wrap);
+
+  peers.set(name, { pc: null, videoEl: v, wrap });
+  return v;
+}
+
+function removePeerCard(name) {
+  const p = peers.get(name);
+  if (!p) return;
+  try { p.pc && p.pc.close(); } catch {}
+  if (p.wrap?.parentNode) p.wrap.parentNode.removeChild(p.wrap);
+  peers.delete(name);
+}
+
+function updateButtonsJoined(joined) {
+  disable(elJoin, joined);
+  disable(elLeave, !joined);
+  disable(elMute, !joined);
+  disable(elCam, !joined);
+  disable(elShare, !joined);
+}
+
+// ---------------------------
+// Local media: start preview immediately
+// ---------------------------
+async function startPreview() {
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 1280, height: 720 } });
     localVideo.srcObject = localStream;
-    micEnabled = true; camEnabled = true;
-    ensurePreviewButtons();
-    showStatus("Preview ready. Join any room to connect.", "ok");
-  }catch(err){
-    console.error(err);
-    showStatus("Could not access camera/mic. Check browser permissions.", "error");
+  } catch (e) {
+    console.error("getUserMedia failed", e);
+    showError("Camera/Mic blocked. Allow permissions.");
   }
 }
-function setMic(enabled){
-  micEnabled = enabled;
-  if (localStream) localStream.getAudioTracks().forEach(t=> t.enabled = enabled);
-  muteBtn.textContent = enabled ? "Mute" : "Unmute";
-  if (currentRoom) socket.emit("status",{ mic: enabled });
-}
-function setCam(enabled){
-  camEnabled = enabled;
-  if (localStream) localStream.getVideoTracks().forEach(t=> t.enabled = enabled);
-  camBtn.textContent = enabled ? "Hide Cam" : "Show Cam";
-  if (currentRoom) socket.emit("status",{ cam: enabled });
-}
+startPreview();
+meName.textContent = "(not joined)";
 
-// ---------- WebRTC ----------
-async function createPC(peerSid){
-  const pc = new RTCPeerConnection(rtcConfig);
-  pc.onicecandidate = e=>{
-    if (e.candidate) socket.emit("signal",{to:peerSid,from:mySid,type:"candidate",payload:e.candidate});
-  };
-  pc.ontrack = e=>{
-    let vid = document.getElementById(`v_${peerSid}`);
-    if (!vid){
-      vid = document.createElement("video");
-      vid.id = `v_${peerSid}`; vid.autoplay = true; vid.playsInline = true;
-      vid.style.width = "100%"; vid.style.aspectRatio="16/9"; vid.style.background="#000"; vid.style.borderRadius="12px";
-      const row = document.getElementById(`p_${peerSid}`) || participantsEl;
-      const wrap = document.createElement("div"); wrap.style.marginTop = "8px"; wrap.appendChild(vid);
-      row.appendChild(wrap);
-    }
-    vid.srcObject = e.streams[0];
-  };
-  if (localStream) localStream.getTracks().forEach(t=> pc.addTrack(t, localStream));
-  pcByPeer.set(peerSid, pc);
-  return pc;
-}
-async function callPeer(peerSid){
-  const pc = await createPC(peerSid);
-  const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
-  socket.emit("signal",{to:peerSid, from:mySid, type:"offer", payload:offer});
-}
-async function handleOffer(from, offer){
-  const pc = await createPC(from);
-  await pc.setRemoteDescription(new RTCSessionDescription(offer));
-  const ans = await pc.createAnswer(); await pc.setLocalDescription(ans);
-  socket.emit("signal",{to:from, from:mySid, type:"answer", payload:ans});
-}
-async function handleAnswer(from, ans){
-  const pc = pcByPeer.get(from); if (!pc) return;
-  await pc.setRemoteDescription(new RTCSessionDescription(ans));
-}
-async function handleCandidate(from, cand){
-  const pc = pcByPeer.get(from); if (!pc) return;
-  try{ await pc.addIceCandidate(new RTCIceCandidate(cand)); }catch(e){ console.error(e); }
-}
+// ---------------------------
+// Join / Leave
+// ---------------------------
+elJoin.addEventListener("click", () => {
+  const n = fmt(elName.value);
+  const r = fmt(elRoom.value);
+  if (!n) return showError("Enter a display name");
+  if (!r) return showError("Enter a room name");
+  myName = n; myRoom = r;
 
-// ---------- UI events ----------
-previewBtn.addEventListener("click", startPreview);
-
-joinBtn.addEventListener("click", async ()=>{
-  const room = roomEl.value.trim();
-  const name = displayNameEl.value.trim() || "Guest";
-  if (!room){ showStatus("Enter a room name.", "warn"); roomEl.focus(); return; }
-
-  joinBtn.textContent = "Joining…";
-  joinBtn.disabled = true;
-
-  if (!localStream){
-    await startPreview();
-    if (!localStream){ joinBtn.textContent = "Join"; joinBtn.disabled = false; return; }
-  }
-
-  if (!socket.connected){
-    socket.connect(); // same-origin
-    showStatus("Connecting to server…");
-  }
-
-  socket.emit("set-name",{ name });
-  socket.emit("join",{ room, name });
+  socket.emit("join", { room: myRoom, user: myName });
 });
 
-leaveBtn.addEventListener("click", ()=>{
-  if (!currentRoom) return;
-  socket.emit("leave",{ room: currentRoom });
-  for (const [,pc] of pcByPeer){ pc.close(); }
-  pcByPeer.clear();
-  participantsEl.innerHTML = "";
-  uiJoined(false);
-  currentRoom=null; mySid=null;
-  showStatus("Left room.", "info");
+elLeave.addEventListener("click", () => {
+  socket.emit("leave");
+  cleanupAfterLeave();
 });
 
-muteBtn.addEventListener("click", ()=> setMic(!micEnabled));
-camBtn.addEventListener("click",  ()=> setCam(!camEnabled));
+function cleanupAfterLeave() {
+  // close peer connections
+  for (const [name, obj] of peers.entries()) {
+    try { obj.pc && obj.pc.close(); } catch {}
+    if (obj.wrap?.parentNode) obj.wrap.parentNode.removeChild(obj.wrap);
+  }
+  peers.clear();
+  myRoom = "";
+  elRoomTitle.textContent = "No room";
+  elTimer.textContent = "";
+  if (timerHandle) { clearInterval(timerHandle); timerHandle = null; }
+  updateButtonsJoined(false);
+  meName.textContent = "(not joined)";
+}
 
-screenBtn.addEventListener("click", async ()=>{
-  if (!localStream) return;
-  try{
-    const screen = await navigator.mediaDevices.getDisplayMedia({video:true,audio:false});
-    const track = screen.getVideoTracks()[0];
-    for (const [,pc] of pcByPeer){
-      const s = pc.getSenders().find(x=>x.track && x.track.kind==="video");
-      if (s) await s.replaceTrack(track);
-    }
-    const old = localStream.getVideoTracks()[0];
-    if (old){ localStream.removeTrack(old); old.stop(); }
-    localStream.addTrack(track); localVideo.srcObject = localStream;
-    showStatus("Sharing screen…", "ok");
-    track.addEventListener("ended", async ()=>{
-      const cam = await navigator.mediaDevices.getUserMedia({video:true});
-      const camTrack = cam.getVideoTracks()[0];
-      for (const [,pc] of pcByPeer){
-        const s = pc.getSenders().find(x=>x.track && x.track.kind==="video");
-        if (s) await s.replaceTrack(camTrack);
+// ---------------------------
+// Mute / Cam / Share
+// ---------------------------
+let audioMuted = false;
+let camHidden = false;
+
+elMute.addEventListener("click", () => {
+  audioMuted = !audioMuted;
+  localStream?.getAudioTracks().forEach(t => t.enabled = !audioMuted);
+  elMute.textContent = audioMuted ? "Unmute" : "Mute";
+});
+
+elCam.addEventListener("click", () => {
+  camHidden = !camHidden;
+  localStream?.getVideoTracks().forEach(t => t.enabled = !camHidden);
+  elCam.textContent = camHidden ? "Show Cam" : "Hide Cam";
+});
+
+elShare.addEventListener("click", async () => {
+  if (!myRoom) return;
+  try {
+    if (!screenStream) {
+      screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      // replace the video track in every PC
+      for (const { pc } of peers.values()) {
+        const senders = pc.getSenders().filter(s => s.track && s.track.kind === "video");
+        if (senders[0]) senders[0].replaceTrack(screenStream.getVideoTracks()[0]);
       }
-      const cur = localStream.getVideoTracks()[0];
-      if (cur){ localStream.removeTrack(cur); cur.stop(); }
-      localStream.addTrack(camTrack); localVideo.srcObject = localStream;
-      showStatus("Screen share stopped.", "info");
+      elShare.textContent = "Stop Share";
+      screenStream.getVideoTracks()[0].addEventListener("ended", () => {
+        // switch back to camera
+        for (const { pc } of peers.values()) {
+          const cam = localStream?.getVideoTracks()[0];
+          const senders = pc.getSenders().filter(s => s.track && s.track.kind === "video");
+          if (cam && senders[0]) senders[0].replaceTrack(cam);
+        }
+        elShare.textContent = "Share Screen";
+        screenStream = null;
+      });
+    } else {
+      // stop share
+      screenStream.getTracks().forEach(t => t.stop());
+      screenStream = null;
+      elShare.textContent = "Share Screen";
+    }
+  } catch (e) {
+    console.error("share failed", e);
+  }
+});
+
+// ---------------------------
+// Heartbeat so server won't kick on brief tab closes
+// ---------------------------
+setInterval(() => socket.emit("heartbeat", {}), 10_000);
+
+// ---------------------------
+// Signaling helpers
+// ---------------------------
+function makePC(forUser, initiator) {
+  const p = new RTCPeerConnection(rtcConfig);
+  // local tracks
+  localStream?.getTracks().forEach(t => p.addTrack(t, localStream));
+  // remote track
+  p.ontrack = (ev) => {
+    const v = addPeerCard(forUser);
+    if (v.srcObject !== ev.streams[0]) v.srcObject = ev.streams[0];
+  };
+  // ICE
+  p.onicecandidate = (ev) => {
+    if (!ev.candidate) return;
+    socket.emit("webrtc-ice-candidate", {
+      room: myRoom, from: myName, to: forUser, candidate: ev.candidate
     });
-  }catch(e){
-    console.error(e);
-    showStatus("Screen share cancelled.", "warn");
+  };
+  // negotiate
+  if (initiator) {
+    // create offer
+    (async () => {
+      const desc = await p.createOffer();
+      await p.setLocalDescription(desc);
+      socket.emit("webrtc-offer", { room: myRoom, from: myName, to: forUser, sdp: p.localDescription });
+    })();
+  }
+  peers.get(forUser).pc = p;
+  return p;
+}
+
+socket.on("webrtc-offer", async (data) => {
+  if (data.to !== myName || data.room !== myRoom) return;
+  const from = data.from;
+  if (!peers.has(from)) addPeerCard(from);
+  const pc = peers.get(from).pc || makePC(from, false);
+  await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  socket.emit("webrtc-answer", { room: myRoom, from: myName, to: from, sdp: pc.localDescription });
+});
+
+socket.on("webrtc-answer", async (data) => {
+  if (data.to !== myName || data.room !== myRoom) return;
+  const from = data.from;
+  const pc = peers.get(from)?.pc;
+  if (!pc) return;
+  await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+});
+
+socket.on("webrtc-ice-candidate", async (data) => {
+  if (data.to !== myName || data.room !== myRoom) return;
+  const from = data.from;
+  const pc = peers.get(from)?.pc;
+  if (!pc) return;
+  try {
+    await pc.addIceCandidate(data.candidate);
+  } catch (e) {
+    console.warn("bad ICE candidate", e);
   }
 });
 
-// ---------- socket events ----------
-socket.on("connect", ()=>{ mySid = socket.id; });
-
-socket.on("joined", ({room, you, name})=>{
-  mySid = you; currentRoom = room;
-  uiJoined(true);
-  ensurePreviewButtons();
-  showStatus(`Joined “${room}” as ${name}.`, "ok");
-  socket.emit("status",{ mic: micEnabled, cam: camEnabled });
+// When someone else announces readiness, connect to them as initiator
+socket.on("ready", ({ user }) => {
+  if (!myRoom || !myName || user === myName) return;
+  if (!peers.has(user)) addPeerCard(user);
+  const pc = peers.get(user).pc || makePC(user, true);
 });
 
-socket.on("peers", async ({peers, you})=>{
-  mySid = you;
-  for (const sid of peers) await callPeer(sid);
+// they left
+socket.on("peer_left", ({ user }) => {
+  removePeerCard(user);
 });
 
-socket.on("peer-left", ({sid})=>{
-  const pc = pcByPeer.get(sid); if (pc) pc.close();
-  pcByPeer.delete(sid);
-  removeParticipant(sid);
-});
-
-socket.on("signal", async ({from, type, payload})=>{
-  if (from === mySid) return;
-  if (type === "offer") await handleOffer(from, payload);
-  else if (type === "answer") await handleAnswer(from, payload);
-  else if (type === "candidate") await handleCandidate(from, payload);
-});
-
-socket.on("rooms", ({rooms})=>{
-  renderRooms(rooms);
-  if (!currentRoom) return;
-  const cur = rooms.find(r=>r.room===currentRoom);
-  if (!cur){ participantsEl.innerHTML=""; return; }
-  const present = new Set();
-  for (const m of cur.members){ upsertParticipant(m); present.add(m.sid); }
-  for (const el of Array.from(participantsEl.querySelectorAll(".p-row"))){
-    const sid = el.id?.replace("p_",""); if (sid && !present.has(sid)) el.remove();
+// ---------------------------
+// Server meta events
+// ---------------------------
+socket.on("joined", (data) => {
+  myRoom = data.room;
+  elRoomTitle.textContent = `Room: ${myRoom}`;
+  meName.textContent = myName;
+  setTimerStart(data.created);
+  // draw any already-present users (we'll connect when they send 'ready')
+  for (const u of data.users) {
+    if (u !== myName) addPeerCard(u);
   }
+  updateButtonsJoined(true);
 });
 
-socket.on("member-status", p=> upsertParticipant(p));
-
-socket.on("disconnect", ()=>{
-  if (currentRoom){
-    uiJoined(false);
-    showStatus("Disconnected from server.", "warn");
-    currentRoom=null;
-  }
+socket.on("join_error", (e) => {
+  showError(e.msg || "Unable to join");
 });
 
-socket.on("error", (e)=>{
-  console.error(e);
-  showStatus(e?.message || "Error occurred.", "error");
-  uiJoined(false);
-  joinBtn.textContent = "Join";
-  joinBtn.disabled = false;
+socket.on("rooms_update", (rooms) => {
+  elRooms.innerHTML = "";
+  rooms.forEach(r => {
+    const li = document.createElement("li");
+    const users = r.users.length ? ` — ${r.users.join(", ")}` : "";
+    li.innerHTML = `<b>${r.name}</b> (${r.users.length})${users}`;
+    elRooms.appendChild(li);
+  });
 });
 
-// ---------- auto-start preview on load ----------
-document.addEventListener("DOMContentLoaded", () => {
-  startPreview();          // show webcam immediately
-  ensurePreviewButtons();  // enable Mute/Hide Cam
-});
+// initial room list + set preview label
+socket.emit("request_rooms");
