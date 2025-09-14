@@ -96,7 +96,7 @@ function refreshKickButtons(){
     const isScreen = name.endsWith(" (Sharing Screen)");
     const pure = name.replace(" (Sharing Screen)","");
     let btn = tile.wrap.querySelector("button.kick");
-    const shouldShow = isAdmin() && pure !== myName && !isScreen;
+    const shouldShow = isAdmin() && pure !== myName && !isScreen; // no kick on screen tiles
     if (shouldShow){
       if (!btn){
         btn = document.createElement("button");
@@ -167,7 +167,7 @@ function createVAD(stream, glowEl){
   return () => { try{ cancelAnimationFrame(raf); }catch{} try{ src.disconnect(); }catch{} try{ analyser.disconnect(); }catch{} };
 }
 
-// --------------------------- preview: create your tile immediately
+// --------------------------- preview
 (async function startPreview(){
   try{
     localStream = await navigator.mediaDevices.getUserMedia({ audio:true, video:{ width:1280, height:720 } });
@@ -229,7 +229,7 @@ elShare.addEventListener("click", async ()=>{
       const tile = ensureTile(screenName);
       tile.video.srcObject = screenStream;
 
-      for (const [peerName, peer] of peers.entries()){
+      for (const peer of peers.values()){
         const sender = peer.pc.addTrack(screenTrack, screenStream);
         if (!peer.screenSenders) peer.screenSenders = new Set();
         peer.screenSenders.add(sender);
@@ -256,11 +256,11 @@ function stopScreenShare(){
   socket.emit("screenshare_state", { room: myRoom, user: myName, active: false });
 }
 
-// --------------------------- Keep server state fresh
+// --------------------------- Keep state fresh
 setInterval(()=> socket.emit("heartbeat",{}), 5_000);
 setInterval(()=> socket.emit("request_rooms"), 7_000);
 
-// --------------------------- WebRTC: Perfect Negotiation
+// --------------------------- WebRTC
 function makePC(forUser, initiator){
   const pc = new RTCPeerConnection(rtcConfig);
   const info = {
@@ -446,7 +446,7 @@ function renderChatMessage(m){
     const body = document.createElement("div"); body.textContent = m.text;
     bubble.appendChild(meta); bubble.appendChild(body);
 
-    // NEW: detect Hububba links and attach embed previews
+    // embeds for hububba links
     const links = extractHububbaLinks(m.text);
     links.forEach(url => addEmbed(bubble, url));
   }
@@ -509,7 +509,7 @@ shareCopy.addEventListener("click", async ()=>{
 socket.emit("request_rooms");
 
 /* =======================
-   EMBED HELPERS (NEW)
+   EMBED HELPERS
    ======================= */
 
 function extractHububbaLinks(text){
@@ -562,10 +562,8 @@ function addEmbed(container, url){
         return;
       }
 
-      // Default title
       title.textContent = data.title || data.site_name || data.domain || "Preview";
 
-      // Media
       media.innerHTML = "";
       const showImg = data.image && typeof data.image === "string";
       if (data.type === "image"){
@@ -589,7 +587,6 @@ function addEmbed(container, url){
         meta.textContent = data.domain || new URL(url).hostname;
       }
 
-      // Actions
       actions.style.display = "flex";
       const openBtn = document.createElement("button");
       openBtn.textContent = "Open";
