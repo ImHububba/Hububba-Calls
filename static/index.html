@@ -36,6 +36,9 @@
           <button id="btnJoin">Join</button>
           <button id="btnLeave" disabled>Leave</button>
         </div>
+        <div class="row" id="conflictRow" style="display:none;">
+          <button id="btnTakeOver" class="danger">Take Over Name</button>
+        </div>
         <div id="errorBox" class="error" style="display:none;"></div>
         <small>Tip: Type any name and press <b>Join</b>. If it doesn’t exist, it’s created.</small>
       </section>
@@ -74,9 +77,7 @@
       </div>
       <div class="modal__content">
         <p><b id="shareWho">Someone</b> invites you to join a room!</p>
-        <div class="codebox">
-          <code id="shareCode">room-code</code>
-        </div>
+        <div class="codebox"><code id="shareCode">room-code</code></div>
       </div>
       <div class="modal__footer">
         <button id="shareCopy">Copy</button>
