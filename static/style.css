@@ -97,3 +97,30 @@ button.danger{border-color:#7a2b28; background:#2a1414; color:#ffd6d4}
   margin-top:8px; padding:12px; background:#0d141b; border:1px dashed var(--line); border-radius:10px; color:#cfe3ff;
   word-break:break-word;
 }
+
+/* Chat */
+.chat-panel .chat{
+  height: 280px;
+  border:1px solid var(--line);
+  border-radius:12px;
+  background:#0d1418;
+  padding:10px;
+  overflow:auto;
+}
+.msg{margin:6px 0; display:flex; gap:8px; align-items:flex-start}
+.msg .bubble{
+  background:#121e28; border:1px solid var(--line); border-radius:10px; padding:8px 10px; max-width:75%;
+  word-break: break-word;
+}
+.msg.me .bubble{border-color:#23486e; background:#0f1a24}
+.msg .meta{font-size:11px; color:#8ea4b9; margin-bottom:3px}
+.msg .name{font-weight:700; color:#dce8f6}
+.msg .name .op{
+  display:inline-block; margin-left:6px; padding:1px 5px; border-radius:6px;
+  background:var(--danger); color:#fff; font-weight:800; font-size:10px;
+}
+.msg.system{justify-content:center}
+.msg.system .bubble{background:transparent; border:1px dashed var(--line); color:#9fb3c9}
+
+.chat-input-row{display:flex; gap:8px; margin-top:8px}
+.chat-input-row input{flex:1}
