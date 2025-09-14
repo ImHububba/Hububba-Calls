@@ -1,225 +1,253 @@
-import os, socket, sys, json, time
-from collections import defaultdict
+import os
+import time
+import threading
+from flask import Flask, send_from_directory, request
+from flask_socketio import SocketIO, emit, join_room, leave_room
 
-# .env optional
-try:
-    from dotenv import load_dotenv
-    if os.path.exists(".env"):
-        load_dotenv(override=True, verbose=False)
-except Exception:
-    pass
+# -----------------------------
+# Flask / Socket.IO setup
+# -----------------------------
+ROOT = os.path.dirname(os.path.abspath(__file__))
+app = Flask(
+    __name__,
+    static_folder=os.path.join(ROOT, "static"),
+    static_url_path="/static",
+)
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev")
 
-from flask import Flask, request, send_from_directory, jsonify
-from flask_socketio import SocketIO, join_room, leave_room, emit
+# CORS: allow everything by default; tighten via env if you want
+allowed = os.environ.get("ALLOWED_ORIGINS", "*")
+socketio = SocketIO(app, cors_allowed_origins=allowed, async_mode="eventlet")
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+GRACE_SECONDS = int(os.environ.get("DISCONNECT_GRACE_SECONDS", "30"))
 
-app = Flask(__name__, static_folder="static")
-socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode="eventlet")
+# -----------------------------
+# In-memory room state
+# rooms: {
+#   "<room>": {
+#       "created": <ts>,
+#       "users": { "<name>": {"sid": <sid>, "last_seen": <ts>} }
+#   }
+# }
+# sid_index: { <sid>: {"room": <room>, "user": <name>} }
+# -----------------------------
+rooms = {}
+sid_index = {}
 
-# presence: rooms -> { sid -> {name, mic, cam, joined_at} }
-room_members: dict[str, dict[str, dict]] = defaultdict(dict)
-# reverse index: sid -> room
-sid_room: dict[str, str] = {}
-# sid -> name
-sid_name: dict[str, str] = {}
+def now() -> float:
+    return time.time()
 
-def now_ms():
-    return int(time.time() * 1000)
-
-def broadcast_rooms():
-    """Send a compact snapshot of all rooms and members to everyone."""
-    snapshot = []
-    for room, members in room_members.items():
-        people = []
-        for sid, st in members.items():
-            people.append({
-                "sid": sid,
-                "name": st.get("name") or f"Guest-{sid[:5]}",
-                "mic": bool(st.get("mic", True)),
-                "cam": bool(st.get("cam", True)),
-                "joined_at": st.get("joined_at", now_ms()),
-            })
-        snapshot.append({
-            "room": room,
-            "count": len(members),
-            "members": people,
+def rooms_snapshot():
+    out = []
+    t = now()
+    for r, v in rooms.items():
+        out.append({
+            "name": r,
+            "users": sorted(list(v["users"].keys())),
+            "elapsed": int(t - v["created"]),
         })
-    socketio.emit("rooms", {"rooms": snapshot})
+    return sorted(out, key=lambda x: x["name"].lower())
 
+def emit_rooms_update():
+    socketio.emit("rooms_update", rooms_snapshot())
+
+def ensure_room(room: str):
+    if room not in rooms:
+        rooms[room] = {"created": now(), "users": {}}
+
+def mark_seen(room: str, user: str, sid: str):
+    ensure_room(room)
+    rooms[room]["users"][user] = {"sid": sid, "last_seen": now()}
+    sid_index[sid] = {"room": room, "user": user}
+
+def remove_user(room: str, user: str, expect_sid: str | None = None):
+    """Remove a user from a room. If expect_sid is passed, only remove if sid matches."""
+    if room not in rooms:
+        return
+    u = rooms[room]["users"].get(user)
+    if not u:
+        return
+    if expect_sid and u["sid"] != expect_sid:
+        return
+    rooms[room]["users"].pop(user, None)
+    # drop stale sid_index entries
+    bad_sids = [sid for sid, meta in sid_index.items()
+                if meta["room"] == room and meta["user"] == user]
+    for s in bad_sids:
+        sid_index.pop(s, None)
+    # delete room if empty
+    if not rooms[room]["users"]:
+        rooms.pop(room, None)
+
+def delayed_cleanup(sid: str):
+    """Wait GRACE_SECONDS; if user did not rejoin, remove them."""
+    time.sleep(GRACE_SECONDS)
+    meta = sid_index.get(sid)
+    if not meta:
+        return  # user already rejoined under a new sid or was removed
+    room = meta["room"]
+    user = meta["user"]
+    # If last_seen is older than grace, remove
+    u = rooms.get(room, {}).get("users", {}).get(user)
+    if not u:
+        sid_index.pop(sid, None)
+        return
+    if now() - u["last_seen"] >= GRACE_SECONDS:
+        remove_user(room, user, expect_sid=u["sid"])
+        emit_rooms_update()
+
+# -----------------------------
+# HTTP
+# -----------------------------
 @app.route("/")
-def root():
-    # serve UI
-    path = os.path.join(app.static_folder or "static", "index.html")
-    if os.path.exists(path):
-        return send_from_directory("static", "index.html")
+def index():
+    return send_from_directory(app.static_folder, "index.html")
+
+@app.route("/health")
+def health():
     return "OK", 200
 
-@app.route("/static/<path:path>")
-def static_files(path):
-    return send_from_directory("static", path)
-
-@app.route("/api/rooms")
-def api_rooms():
-    data = []
-    for room, members in room_members.items():
-        data.append({
-            "room": room,
-            "count": len(members),
-            "members": [
-                {
-                    "sid": sid,
-                    "name": st.get("name") or f"Guest-{sid[:5]}",
-                    "mic": bool(st.get("mic", True)),
-                    "cam": bool(st.get("cam", True)),
-                    "joined_at": st.get("joined_at", now_ms()),
-                } for sid, st in members.items()
-            ]
-        })
-    return jsonify({"rooms": data})
-
+# -----------------------------
+# Socket.IO events
+# -----------------------------
 @socketio.on("connect")
 def on_connect():
-    print(f"[+] connect {request.sid}")
+    emit("hello", {"ok": True})
 
-@socketio.on("disconnect")
-def on_disconnect():
+@socketio.on("heartbeat")
+def on_heartbeat(data=None):
+    """Keep last_seen fresh while the tab is alive."""
     sid = request.sid
-    print(f"[-] disconnect {sid}")
-    room = sid_room.pop(sid, None)
-    if room:
-        room_members[room].pop(sid, None)
-        if not room_members[room]:
-            room_members.pop(room, None)
-        socketio.emit("peer-left", {"sid": sid}, room=room)
-    sid_name.pop(sid, None)
-    broadcast_rooms()
+    meta = sid_index.get(sid)
+    if meta:
+        mark_seen(meta["room"], meta["user"], sid)
 
-@socketio.on("set-name")
-def on_set_name(data):
-    name = (data or {}).get("name", "").strip()
-    if not name:
-        return
-    sid = request.sid
-    sid_name[sid] = name
-    room = sid_room.get(sid)
-    if room and sid in room_members[room]:
-        room_members[room][sid]["name"] = name
-        broadcast_rooms()
+@socketio.on("request_rooms")
+def on_request_rooms():
+    emit("rooms_update", rooms_snapshot())
 
 @socketio.on("join")
 def on_join(data):
     room = (data or {}).get("room", "").strip()
-    name = (data or {}).get("name", "").strip()
+    user = (data or {}).get("user", "").strip()
+
     if not room:
-        emit("error", {"message": "Room required"})
+        emit("join_error", {"field": "room", "msg": "Room name required"})
+        return
+    if not user:
+        emit("join_error", {"field": "user", "msg": "Display name required"})
         return
 
-    sid = request.sid
+    ensure_room(room)
+    existing = rooms[room]["users"].get(user)
+
+    # name taken protection with grace
+    if existing and existing["sid"] != request.sid:
+        recent = now() - existing["last_seen"] < GRACE_SECONDS
+        if recent:
+            emit("join_error", {"field": "user", "msg": "That name is already in this room"})
+            return
+        # stale holder; allow takeover
+
     join_room(room)
-    sid_room[sid] = room
-    if name:
-        sid_name[sid] = name
+    mark_seen(room, user, request.sid)
 
-    room_members[room][sid] = {
-        "name": sid_name.get(sid) or f"Guest-{sid[:5]}",
-        "mic": True,
-        "cam": True,
-        "joined_at": now_ms(),
-    }
-    others = [other for other in room_members[room].keys() if other != sid]
-    emit("peers", {"peers": others, "you": sid}, to=sid)
-    # NEW: immediate confirmation so client can update UI
-    emit("joined", {"room": room, "you": sid, "name": room_members[room][sid]["name"]}, to=sid)
+    # tell everyone a peer is ready (mesh fanout)
+    socketio.emit("ready", {"user": user}, to=room, skip_sid=request.sid)
 
-    print(f"[room:{room}] {sid} joined; {len(room_members[room])} member(s)")
-    broadcast_rooms()
+    # send joined+room meta to the new client
+    emit("joined", {
+        "room": room,
+        "created": rooms[room]["created"],
+        "users": sorted(list(rooms[room]["users"].keys()))
+    })
+
+    emit_rooms_update()
 
 @socketio.on("leave")
 def on_leave(data):
     sid = request.sid
-    room = sid_room.pop(sid, None)
-    if not room:
+    meta = sid_index.get(sid)
+    if not meta:
         return
-    if sid in room_members[room]:
-        room_members[room].pop(sid, None)
+    room = meta["room"]
+    user = meta["user"]
     leave_room(room)
-    socketio.emit("peer-left", {"sid": sid}, room=room)
-    if not room_members[room]:
-        room_members.pop(room, None)
-    print(f"[room:{room}] {sid} left; {len(room_members.get(room, {}))} member(s)")
-    broadcast_rooms()
+    remove_user(room, user, expect_sid=sid)
+    emit_rooms_update()
+    # notify peers that user left
+    socketio.emit("peer_left", {"user": user}, to=room)
 
-@socketio.on("status")
-def on_status(data):
+@socketio.on("disconnect")
+def on_disconnect():
+    # don't remove instantly—start grace timer
     sid = request.sid
-    mic = (data or {}).get("mic")
-    cam = (data or {}).get("cam")
-    room = sid_room.get(sid)
-    if not room:
+    meta = sid_index.get(sid)
+    if meta:
+        # mark last_seen at disconnect time
+        mark_seen(meta["room"], meta["user"], sid)
+        threading.Thread(target=delayed_cleanup, args=(sid,), daemon=True).start()
+
+# ---------- Signaling: target-by-username via server routing ----------
+
+def _sid_for(room: str, name: str) -> str | None:
+    u = rooms.get(room, {}).get("users", {}).get(name)
+    return None if not u else u["sid"]
+
+@socketio.on("webrtc-offer")
+def on_webrtc_offer(data):
+    room = data.get("room")
+    to = data.get("to")
+    if not room or not to:
         return
-    st = room_members[room].get(sid) or {}
-    if mic is not None:
-        st["mic"] = bool(mic)
-    if cam is not None:
-        st["cam"] = bool(cam)
-    st["name"] = sid_name.get(sid) or st.get("name") or f"Guest-{sid[:5]}"
-    room_members[room][sid] = st
-    socketio.emit("member-status", {
-        "sid": sid,
-        "name": st["name"],
-        "mic": st.get("mic", True),
-        "cam": st.get("cam", True),
-    }, room=room)
-    broadcast_rooms()
+    sid = _sid_for(room, to)
+    if sid:
+        emit("webrtc-offer", data, to=sid)
 
-@socketio.on("signal")
-def on_signal(data):
-    target = (data or {}).get("to")
-    if not target:
+@socketio.on("webrtc-answer")
+def on_webrtc_answer(data):
+    room = data.get("room")
+    to = data.get("to")
+    if not room or not to:
         return
-    socketio.emit("signal", data, to=target)
+    sid = _sid_for(room, to)
+    if sid:
+        emit("webrtc-answer", data, to=sid)
 
-# ---------- port helpers ----------
-def is_port_free(host: str, port: int) -> bool:
-    import socket as pysock
-    with pysock.socket(pysock.AF_INET, pysock.SOCK_STREAM) as s:
-        s.setsockopt(pysock.SOL_SOCKET, pysock.SO_REUSEADDR, 1)
-        try:
-            s.bind((host, port))
-            return True
-        except OSError:
-            return False
+@socketio.on("webrtc-ice-candidate")
+def on_webrtc_ice(data):
+    room = data.get("room")
+    to = data.get("to")
+    if not room or not to:
+        return
+    sid = _sid_for(room, to)
+    if sid:
+        emit("webrtc-ice-candidate", data, to=sid)
 
-def find_open_port(start_port: int, host: str = "0.0.0.0", max_increments: int = 100) -> int:
-    for offset in range(0, max_increments + 1):
-        candidate = start_port + offset
-        if is_port_free(host, candidate):
-            return candidate
-    raise RuntimeError(f"No free port found from {start_port} to {start_port + max_increments}")
-
-def parse_cli_port(default_port: int) -> int:
-    argv = sys.argv[1:]
-    for i, arg in enumerate(argv):
-        if arg in ("--port", "-p") and i + 1 < len(argv):
+# -----------------------------
+# Entrypoint (auto-pick open port)
+# -----------------------------
+def find_open_port(start: int) -> int:
+    import socket
+    port = start
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
-                return int(argv[i + 1])
-            except ValueError:
-                pass
-    return default_port
+                s.bind(("0.0.0.0", port))
+            except OSError:
+                port += 1
+                continue
+            return port
 
 if __name__ == "__main__":
-    host = os.getenv("HOST", "0.0.0.0")
-    base_port = parse_cli_port(int(os.getenv("PORT", "5000")))
-    chosen_port = find_open_port(base_port, host=host, max_increments=100)
-
-    print("=" * 72)
-    print("Hububba Calls (Flask-SocketIO)")
-    print(f" CORS: {ALLOWED_ORIGINS}")
-    print(f" Host: {host}")
-    print(f" Requested: {base_port} -> Using: {chosen_port}")
-    print(f" UI:    http://localhost:{chosen_port}")
-    print(f" Rooms: GET /api/rooms")
-    print("=" * 72)
-
-    socketio.run(app, host=host, port=chosen_port)
+    req = int(os.environ.get("PORT", "5000"))
+    port = req if req > 0 else 5000
+    if "PORT" not in os.environ:
+        # find next open if 5000 is busy (local dev convenience)
+        port = find_open_port(port)
+    print(
+        "\n" + "=" * 70 +
+        f"\nHububba Calls (Socket.IO)\n CORS: {allowed}\n Host: 0.0.0.0\n Port: {port}\n" +
+        "=" * 70 + "\n"
+    )
+    socketio.run(app, host="0.0.0.0", port=port)
