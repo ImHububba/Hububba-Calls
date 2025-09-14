@@ -32,6 +32,8 @@ button{
 }
 button:disabled{opacity:.4; cursor:not-allowed}
 button.danger{border-color:#7a2b28; background:#2a1414; color:#ffd6d4}
+.icon-btn{background:transparent; border:1px solid var(--line); border-radius:8px; color:var(--text); padding:4px 8px; cursor:pointer}
+
 .row{display:flex; gap:8px; margin-top:8px}
 
 .panel{margin-bottom:18px}
@@ -44,6 +46,10 @@ button.danger{border-color:#7a2b28; background:#2a1414; color:#ffd6d4}
 .name-label{
   position:absolute; left:10px; bottom:10px; padding:4px 8px; border-radius:8px;
   background:rgba(0,0,0,.5); color:#fff; font-weight:600; font-size:12px;
+}
+.peer .kick{
+  position:absolute; right:8px; top:8px;
+  background:#2a1414; color:#ffd6d4; border:1px solid #7a2b28; border-radius:8px; padding:4px 8px; cursor:pointer; font-size:12px;
 }
 
 .rooms{list-style:none; padding:0; margin:0}
@@ -58,3 +64,20 @@ button.danger{border-color:#7a2b28; background:#2a1414; color:#ffd6d4}
   padding:10px 14px; border-radius:10px; pointer-events:none; opacity:0; transition:opacity .15s ease;
 }
 .toast.show{opacity:1}
+
+/* Modal */
+.modal{position:fixed; inset:0; display:none}
+.modal.open{display:block}
+.modal__backdrop{position:absolute; inset:0; background:rgba(0,0,0,.5)}
+.modal__body{
+  position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+  width:min(92vw,460px); background:#101820; border:1px solid var(--line); border-radius:16px; overflow:hidden;
+}
+.modal__header{display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid var(--line)}
+.modal__title{font-weight:700}
+.modal__content{padding:14px}
+.modal__footer{padding:12px 14px; border-top:1px solid var(--line); text-align:right}
+.codebox{
+  margin-top:8px; padding:12px; background:#0d141b; border:1px dashed var(--line); border-radius:10px; color:#cfe3ff;
+  word-break:break-word;
+}
