@@ -1,7 +1,7 @@
 // Socket
 const socket = io({ transports: ["websocket"] });
 
-// UI
+// UI refs
 const elName = document.getElementById("displayName");
 const elRoom = document.getElementById("roomInput");
 const elJoin = document.getElementById("btnJoin");
@@ -19,18 +19,13 @@ const elRoomTitle = document.getElementById("roomTitle");
 const elTimer = document.getElementById("roomTimer");
 const toastEl = document.getElementById("toast");
 
-// Share modal
 const shareModal = document.getElementById("shareModal");
 const shareWho   = document.getElementById("shareWho");
 const shareCode  = document.getElementById("shareCode");
 const shareCopy  = document.getElementById("shareCopy");
 const shareClose = document.getElementById("shareClose");
 
-// Video / peers
-const localVideo = document.getElementById("localVideo");
-const meName = document.getElementById("meName");
-const meCard = document.getElementById("meCard");
-const peersGrid = document.getElementById("peers");
+const stage = document.getElementById("stage");
 
 // Chat
 const chatEl = document.getElementById("chatMessages");
@@ -46,16 +41,20 @@ let timerHandle = null;
 
 let localStream = null;
 let screenStream = null;
-
-// peers: name -> { pc, videoEl, wrap, labelEl, stopVAD? }
-const peers = new Map();
+let screenActive = false;
 
 const rtcConfig = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+// Map of remote user -> peerConnection & helpers
+// peers.get(username) => { pc, makingOffer, ignoreOffer, polite, screenSenders:Set<RTCRtpSender>, cameraStreamId }
+const peers = new Map();
+
+// Tiles: displayName -> { wrap, video, label, stopVAD? }
+const tiles = new Map();
+
 const isAdmin = () => !!myName && !!currentOwner && myName === currentOwner;
 
-// ---------------------------
-// Helpers
-// ---------------------------
+// --------------------------- helpers
 const fmt = (s) => (s == null ? "" : String(s).trim());
 const disable = (el, v) => (el.disabled = !!v);
 function toast(msg){ toastEl.textContent = msg; toastEl.classList.add("show"); setTimeout(()=>toastEl.classList.remove("show"), 1400); }
@@ -82,47 +81,62 @@ function updateButtonsJoined(joined){
 function applyOpBadge(labelEl, on){
   if (!labelEl) return;
   let tag = labelEl.querySelector(".op");
-  if (on){
-    if (!tag){
-      tag = document.createElement("span");
-      tag.className = "op";
-      tag.textContent = "(OP)";
-      labelEl.appendChild(tag);
-    }
-  } else {
-    if (tag) tag.remove();
+  if (on){ if (!tag){ tag = document.createElement("span"); tag.className="op"; tag.textContent="(OP)"; labelEl.appendChild(tag); } }
+  else { if (tag) tag.remove(); }
+}
+
+function refreshOpBadges(){
+  for (const [name, tile] of tiles.entries()){
+    const pure = name.replace(" (Sharing Screen)","");
+    applyOpBadge(tile.label, pure === currentOwner);
   }
 }
 
-function renderMeName(){
-  meName.textContent = myName || "(not joined)";
-  applyOpBadge(meName, isAdmin());
-}
-
-function refreshAdminControls(){
-  // Toggle kick buttons on peer tiles
-  for (const [name,obj] of peers.entries()){
-    let btn = obj.wrap.querySelector("button.kick");
-    if (isAdmin() && name !== myName){
+function refreshKickButtons(){
+  for (const [name, tile] of tiles.entries()){
+    const isScreen = name.endsWith(" (Sharing Screen)");
+    const pure = name.replace(" (Sharing Screen)","");
+    let btn = tile.wrap.querySelector("button.kick");
+    const shouldShow = isAdmin() && pure !== myName && !isScreen; // don't show on screen tiles
+    if (shouldShow){
       if (!btn){
         btn = document.createElement("button");
         btn.className = "kick"; btn.textContent = "Kick";
-        btn.addEventListener("click", () => socket.emit("kick_user", { room: myRoom, target: name }));
-        obj.wrap.appendChild(btn);
+        btn.addEventListener("click", () => socket.emit("kick_user", { room: myRoom, target: pure }));
+        tile.wrap.appendChild(btn);
       }
     } else {
       if (btn) btn.remove();
     }
-    // OP badge on labels
-    applyOpBadge(obj.labelEl, name === currentOwner);
   }
-  // OP badge on self label
-  applyOpBadge(meName, isAdmin());
 }
 
-// ---------------------------
-// Voice Activity Detection (glow)
-// ---------------------------
+function ensureTile(name){
+  if (tiles.has(name)) return tiles.get(name);
+  const wrap = document.createElement("div"); wrap.className="tile";
+  const v = document.createElement("video"); v.autoplay = true; v.playsInline = true; if (name === myName || name === "You") v.muted = true;
+  const label = document.createElement("div"); label.className="name-label"; label.textContent = name;
+  wrap.appendChild(v); wrap.appendChild(label);
+  stage.appendChild(wrap);
+  const t = { wrap, video: v, label, stopVAD: null };
+  tiles.set(name, t);
+  refreshOpBadges(); refreshKickButtons();
+  return t;
+}
+function removeTile(name){
+  const t = tiles.get(name); if (!t) return;
+  try{ t.stopVAD && t.stopVAD(); }catch{}
+  if (t.wrap?.parentNode) t.wrap.parentNode.removeChild(t.wrap);
+  tiles.delete(name);
+}
+function renameTile(oldName, newName){
+  if (oldName === newName) return;
+  const t = tiles.get(oldName); if (!t) return;
+  tiles.delete(oldName); tiles.set(newName, t);
+  t.label.textContent = newName;
+  refreshOpBadges(); refreshKickButtons();
+}
+
 let audioCtx = null;
 function ensureAudioCtx(){
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -139,80 +153,35 @@ function createVAD(stream, glowEl){
 
   let raf = null;
   let decay = 0;
-  const THRESH = 12; // empirical loudness threshold
-  const DECAY_RATE = 0.92;
+  const THRESH = 12, DECAY_RATE = 0.92;
 
   function loop(){
     analyser.getByteFrequencyData(data);
-    let sum = 0;
-    for (let i=0;i<data.length;i++) sum += data[i];
-    const level = sum / data.length; // 0..255
+    let sum = 0; for (let i=0;i<data.length;i++) sum += data[i];
+    const level = sum / data.length;
     decay = Math.max(level, decay * DECAY_RATE);
     if (decay > THRESH) glowEl.classList.add("speaking");
     else glowEl.classList.remove("speaking");
     raf = requestAnimationFrame(loop);
   }
   loop();
-
   return () => { try{ cancelAnimationFrame(raf); }catch{} try{ src.disconnect(); }catch{} try{ analyser.disconnect(); }catch{} };
 }
 
-// ---------------------------
-// DOM builders
-// ---------------------------
-function addPeerCard(name){
-  if (peers.has(name)) return peers.get(name).videoEl;
-
-  const wrap = document.createElement("div"); wrap.className="peer";
-  const v = document.createElement("video"); v.autoplay=true; v.playsInline=true;
-  const label = document.createElement("div"); label.className="name-label"; label.textContent=name;
-  wrap.appendChild(v); wrap.appendChild(label);
-
-  peersGrid.appendChild(wrap);
-  peers.set(name, { pc:null, videoEl:v, wrap, labelEl:label, stopVAD:null });
-
-  // Add OP badge & kick control if applicable
-  applyOpBadge(label, name === currentOwner);
-  refreshAdminControls();
-
-  return v;
-}
-
-function removePeerCard(name){
-  const p = peers.get(name); if(!p) return;
-  try{ p.pc && p.pc.close(); }catch{}
-  try{ p.stopVAD && p.stopVAD(); }catch{}
-  if (p.wrap?.parentNode) p.wrap.parentNode.removeChild(p.wrap);
-  peers.delete(name);
-}
-
-function cleanupAllPeers(){
-  for (const [name,obj] of peers.entries()){
-    try{ obj.pc && obj.pc.close(); }catch{}
-    try{ obj.stopVAD && obj.stopVAD(); }catch{}
-    if (obj.wrap?.parentNode) obj.wrap.parentNode.removeChild(obj.wrap);
-  }
-  peers.clear();
-}
-
-// ---------------------------
-// Local preview immediately
-// ---------------------------
+// --------------------------- preview: create your tile immediately
 (async function startPreview(){
   try{
     localStream = await navigator.mediaDevices.getUserMedia({ audio:true, video:{ width:1280, height:720 } });
-    localVideo.srcObject = localStream;
-    try{ const stop = createVAD(localStream, meCard); meCard._stopVAD = stop; }catch{}
+    const t = ensureTile("You");
+    t.video.srcObject = localStream;
+    try{ t.stopVAD = createVAD(localStream, t.wrap); }catch{}
   }catch(e){
     console.error("getUserMedia failed", e);
     showError("Camera/Mic blocked. Allow permissions.");
   }
 })();
-renderMeName();
 
-// ---------------------------
-// Join / Leave
-// ---------------------------
+// --------------------------- Join / Leave
 let lastJoinForce = false;
 
 elJoin.addEventListener("click", ()=> tryJoin(false));
@@ -223,7 +192,6 @@ function tryJoin(force){
   lastJoinForce = !!force;
   socket.emit("join", { room:r, user:n, force: !!force });
 }
-
 elTakeOver?.addEventListener("click", ()=> tryJoin(true));
 
 elLeave.addEventListener("click", ()=> {
@@ -232,108 +200,187 @@ elLeave.addEventListener("click", ()=> {
 });
 
 function cleanupAfterLeave(){
-  cleanupAllPeers();
+  // close PCs
+  for (const p of peers.values()){ try{ p.pc.close(); }catch{} }
+  peers.clear();
+  // remove all tiles except local preview "You"
+  for (const name of Array.from(tiles.keys())){
+    if (name !== "You") removeTile(name);
+  }
+  // reset self
   myRoom=""; currentOwner=""; elRoomTitle.textContent="No room"; elTimer.textContent="";
   if (timerHandle){ clearInterval(timerHandle); timerHandle=null; }
-  updateButtonsJoined(false); myName=""; renderMeName();
+  updateButtonsJoined(false); myName="";
+  // set preview tile label back
+  if (tiles.has("You")) applyOpBadge(tiles.get("You").label, false);
   elConflictRow && (elConflictRow.style.display = "none");
-  chatEl.innerHTML=""; // clear chat
+  chatEl.innerHTML="";
+  screenActive = false; screenStream = null;
 }
 
-// ---------------------------
-// Mute / Cam / ShareScreen
-// ---------------------------
+// --------------------------- Mute / Cam / ShareScreen
 let audioMuted=false, camHidden=false;
 elMute.addEventListener("click", ()=>{ audioMuted=!audioMuted; localStream?.getAudioTracks().forEach(t=>t.enabled=!audioMuted); elMute.textContent=audioMuted?"Unmute":"Mute"; });
 elCam.addEventListener("click",  ()=>{ camHidden=!camHidden;   localStream?.getVideoTracks().forEach(t=>t.enabled=!camHidden);   elCam.textContent=camHidden?"Show Cam":"Hide Cam"; });
+
 elShare.addEventListener("click", async ()=>{
   if (!myRoom) return;
   try{
-    if(!screenStream){
+    if(!screenActive){
       screenStream = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:false });
-      for (const {pc} of peers.values()){
-        const senders = pc.getSenders().filter(s=>s.track && s.track.kind==="video");
-        if (senders[0]) senders[0].replaceTrack(screenStream.getVideoTracks()[0]);
+      const screenTrack = screenStream.getVideoTracks()[0];
+
+      // local tile for screen
+      const screenName = `${myName} (Sharing Screen)`;
+      const tile = ensureTile(screenName);
+      tile.video.srcObject = screenStream;
+
+      // add track to each pc (separate sender, not replacing camera)
+      for (const [peerName, peer] of peers.entries()){
+        const sender = peer.pc.addTrack(screenTrack, screenStream);
+        if (!peer.screenSenders) peer.screenSenders = new Set();
+        peer.screenSenders.add(sender);
       }
-      elShare.textContent="Stop Share";
-      screenStream.getVideoTracks()[0].addEventListener("ended", ()=>{
-        for (const {pc} of peers.values()){
-          const cam = localStream?.getVideoTracks()[0];
-          const senders = pc.getSenders().filter(s=>s.track && s.track.kind==="video");
-          if (cam && senders[0]) senders[0].replaceTrack(cam);
-        }
-        elShare.textContent="Share Screen"; screenStream=null;
-      });
-    }else{
-      screenStream.getTracks().forEach(t=>t.stop()); screenStream=null; elShare.textContent="Share Screen";
+      // negotiate (perfect negotiation handles offer)
+      // when screen ends
+      screenTrack.addEventListener("ended", stopScreenShare);
+      screenActive = true; elShare.textContent = "Stop Share";
+      socket.emit("screenshare_state", { room: myRoom, user: myName, active: true });
+    } else {
+      stopScreenShare();
     }
   }catch(e){ console.error("share failed", e); }
 });
 
-// ---------------------------
-// Keep server state fresh
-// ---------------------------
-setInterval(()=> socket.emit("heartbeat",{}), 5_000);
-setInterval(()=> socket.emit("request_rooms"), 7_000); // avoid stale room list
+function stopScreenShare(){
+  if (!screenActive) return;
+  try{ screenStream.getTracks().forEach(t=>t.stop()); }catch{}
+  // remove senders and renegotiate
+  for (const peer of peers.values()){
+    if (peer.screenSenders){
+      for (const s of Array.from(peer.screenSenders)){ try{ peer.pc.removeTrack(s); }catch{} peer.screenSenders.delete(s); }
+    }
+  }
+  removeTile(`${myName} (Sharing Screen)`);
+  screenActive = false; elShare.textContent = "Share Screen";
+  socket.emit("screenshare_state", { room: myRoom, user: myName, active: false });
+}
 
-// ---------------------------
-// WebRTC signaling
-// ---------------------------
+// --------------------------- Keep server state fresh
+setInterval(()=> socket.emit("heartbeat",{}), 5_000);
+setInterval(()=> socket.emit("request_rooms"), 7_000);
+
+// --------------------------- WebRTC: Perfect Negotiation
 function makePC(forUser, initiator){
-  const p = new RTCPeerConnection(rtcConfig);
-  localStream?.getTracks().forEach(t=>p.addTrack(t, localStream));
-  p.ontrack = (ev)=>{
-    const v = addPeerCard(forUser);
-    const stream = ev.streams[0];
-    if (v.srcObject !== stream) v.srcObject = stream;
-    // Set up remote VAD glow
-    const obj = peers.get(forUser);
-    try{ obj.stopVAD && obj.stopVAD(); }catch{}
-    try{ obj.stopVAD = createVAD(stream, obj.wrap); }catch{}
+  const pc = new RTCPeerConnection(rtcConfig);
+  const info = {
+    pc,
+    makingOffer:false,
+    ignoreOffer:false,
+    polite: myName < forUser, // deterministic
+    screenSenders: new Set(),
+    cameraStreamId: null
   };
-  p.onicecandidate = (ev)=>{
+  peers.set(forUser, info);
+
+  // local tracks (camera + mic)
+  localStream?.getTracks().forEach(t=>pc.addTrack(t, localStream));
+
+  pc.ontrack = (ev)=>{
+    // Determine whether this is the first video (camera) or extra (screen)
+    const stream = ev.streams[0];
+    if (ev.track.kind === "video"){
+      if (!info.cameraStreamId){
+        // first video we see for this peer => camera
+        info.cameraStreamId = stream.id;
+        const camTile = ensureTile(forUser);
+        if (camTile.video.srcObject !== stream) camTile.video.srcObject = stream;
+      } else if (stream.id !== info.cameraStreamId) {
+        // second distinct stream => screenshare
+        const scrTile = ensureTile(`${forUser} (Sharing Screen)`);
+        if (scrTile.video.srcObject !== stream) scrTile.video.srcObject = stream;
+      } else {
+        // same stream, just another track event; ignore
+      }
+    } else if (ev.track.kind === "audio"){
+      // nothing UI-wise; VAD from remote stream is handled below if wanted
+    }
+  };
+
+  pc.onicecandidate = (ev)=>{
     if (!ev.candidate) return;
     socket.emit("webrtc-ice-candidate", { room:myRoom, from:myName, to:forUser, candidate:ev.candidate });
   };
+
+  pc.onnegotiationneeded = async ()=>{
+    try{
+      info.makingOffer = true;
+      await pc.setLocalDescription();
+      socket.emit("webrtc-offer", { room:myRoom, from:myName, to:forUser, sdp:pc.localDescription });
+    }catch(e){ console.warn("negotiationneeded failed", e); }
+    finally{ info.makingOffer = false; }
+  };
+
+  // if we are the initial caller, kick off offer once tracks are added
   if (initiator){
     (async ()=>{
-      const desc = await p.createOffer();
-      await p.setLocalDescription(desc);
-      socket.emit("webrtc-offer", { room:myRoom, from:myName, to:forUser, sdp:p.localDescription });
+      try{
+        await pc.setLocalDescription(await pc.createOffer());
+        socket.emit("webrtc-offer", { room:myRoom, from:myName, to:forUser, sdp:pc.localDescription });
+      }catch(e){ console.error(e); }
     })();
   }
-  peers.get(forUser).pc = p;
-  return p;
+  return pc;
 }
 
 socket.on("webrtc-offer", async (data)=>{
   if (data.to!==myName || data.room!==myRoom) return;
-  const from=data.from; if (!peers.has(from)) addPeerCard(from);
-  const pc = peers.get(from).pc || makePC(from,false);
-  await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-  const answer = await pc.createAnswer(); await pc.setLocalDescription(answer);
-  socket.emit("webrtc-answer",{ room:myRoom, from:myName, to:from, sdp:pc.localDescription });
+  const from = data.from;
+  let peer = peers.get(from);
+  if (!peer){ const pc = makePC(from, false); peer = peers.get(from); }
+  const pc = peer.pc;
+
+  const offer = new RTCSessionDescription(data.sdp);
+  const offerCollision = peer.makingOffer || pc.signalingState !== "stable";
+  peer.ignoreOffer = !peer.polite && offerCollision;
+  if (peer.ignoreOffer) return;
+
+  try{
+    await pc.setRemoteDescription(offer);
+    await pc.setLocalDescription(await pc.createAnswer());
+    socket.emit("webrtc-answer",{ room:myRoom, from:myName, to:from, sdp:pc.localDescription });
+  }catch(e){
+    console.error("error applying offer", e);
+  }
 });
 
 socket.on("webrtc-answer", async (data)=>{
   if (data.to!==myName || data.room!==myRoom) return;
-  const pc = peers.get(data.from)?.pc; if(!pc) return;
-  await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+  const from = data.from;
+  const pc = peers.get(from)?.pc; if(!pc) return;
+  try{ await pc.setRemoteDescription(new RTCSessionDescription(data.sdp)); }catch(e){ console.error("answer setRemote failed", e); }
 });
 
 socket.on("webrtc-ice-candidate", async (data)=>{
   if (data.to!==myName || data.room!==myRoom) return;
   const pc = peers.get(data.from)?.pc; if(!pc) return;
-  try{ await pc.addIceCandidate(data.candidate); }catch{}
+  try{ await pc.addIceCandidate(data.candidate); }catch(e){ /* ignore during glare */ }
 });
 
 // presence
 socket.on("ready", ({user})=>{
   if(!myRoom || !myName || user===myName) return;
-  if(!peers.has(user)) addPeerCard(user);
-  const pc = peers.get(user).pc || makePC(user,true);
+  let peer = peers.get(user);
+  if (!peer){ const pc = makePC(user,true); }
 });
-socket.on("peer_left", ({user})=> removePeerCard(user));
+socket.on("peer_left", ({user})=>{
+  // remove both camera & possible screen tiles
+  removeTile(user);
+  removeTile(`${user} (Sharing Screen)`);
+  // close pc
+  const p = peers.get(user);
+  if (p){ try{ p.pc.close(); }catch{} peers.delete(user); }
+});
 
 // server meta
 socket.on("joined", (data)=>{
@@ -341,18 +388,23 @@ socket.on("joined", (data)=>{
   myRoom = data.room;
   currentOwner = data.owner || "";
   elRoomTitle.textContent = `Room: ${myRoom}`;
-  renderMeName();
   setTimerStart(data.created);
 
-  // rebuild peers list from server truth
-  peersGrid.innerHTML=""; cleanupAllPeers();
-  for (const u of data.users){
-    if (u !== myName) addPeerCard(u);
+  // rename local preview tile from "You" -> myName
+  if (tiles.has("You")) renameTile("You", myName);
+
+  // rebuild from server truth
+  for (const name of Array.from(tiles.keys())){
+    if (name !== myName) removeTile(name);
   }
+  for (const u of data.users){
+    if (u !== myName) ensureTile(u); // peers will fill video ontrack
+  }
+
   updateButtonsJoined(true);
   elConflictRow && (elConflictRow.style.display = "none");
+  refreshOpBadges(); refreshKickButtons();
 
-  refreshAdminControls();
   socket.emit("request_rooms");
 
   // load chat history
@@ -364,7 +416,7 @@ socket.on("joined", (data)=>{
 socket.on("owner_changed", ({room, owner})=>{
   if (room !== myRoom) return;
   currentOwner = owner || "";
-  refreshAdminControls();
+  refreshOpBadges(); refreshKickButtons();
   toast(owner ? `Operator: ${owner}` : "No operator");
 });
 
@@ -396,82 +448,51 @@ socket.on("rooms_update", (rooms)=> {
   });
 });
 
-// ---------------------------
-// Chat UI
-// ---------------------------
+// --------------------------- Chat
 function tsToTime(ts){
-  try{
-    const d = new Date(ts*1000);
-    return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-  }catch{ return ""; }
+  try{ const d = new Date(ts*1000); return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
+  catch{ return ""; }
 }
-
 function renderChatMessage(m){
   const isMe = m.user && myName && m.user === myName;
   const row = document.createElement("div");
   row.className = "msg" + (m.type === "system" ? " system" : isMe ? " me" : "");
-  const bubble = document.createElement("div");
-  bubble.className = "bubble";
+  const bubble = document.createElement("div"); bubble.className = "bubble";
 
   if (m.type === "system"){
     bubble.textContent = `• ${m.text}`;
   } else {
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    const nameEl = document.createElement("span");
-    nameEl.className = "name";
-    nameEl.textContent = m.user || "unknown";
-    // OP badge next to name if current owner (dynamic)
-    if (currentOwner && m.user === currentOwner){
-      const badge = document.createElement("span");
-      badge.className = "op";
-      badge.textContent = "(OP)";
-      nameEl.appendChild(badge);
-    }
-    const timeEl = document.createElement("span");
-    timeEl.textContent = " • " + tsToTime(m.ts);
-    meta.appendChild(nameEl);
-    meta.appendChild(timeEl);
-
-    const body = document.createElement("div");
-    body.textContent = m.text;
-
-    bubble.appendChild(meta);
-    bubble.appendChild(body);
+    const meta = document.createElement("div"); meta.className = "meta";
+    const nameEl = document.createElement("span"); nameEl.className = "name"; nameEl.textContent = m.user || "unknown";
+    if (currentOwner && m.user === currentOwner){ const badge=document.createElement("span"); badge.className="op"; badge.textContent="(OP)"; nameEl.appendChild(badge); }
+    const timeEl = document.createElement("span"); timeEl.textContent = " • " + tsToTime(m.ts);
+    meta.appendChild(nameEl); meta.appendChild(timeEl);
+    const body = document.createElement("div"); body.textContent = m.text;
+    bubble.appendChild(meta); bubble.appendChild(body);
   }
-
-  row.appendChild(bubble);
-  chatEl.appendChild(row);
+  row.appendChild(bubble); chatEl.appendChild(row);
 }
-
-function scrollChatToBottom(){
-  chatEl.scrollTop = chatEl.scrollHeight;
-}
+function scrollChatToBottom(){ chatEl.scrollTop = chatEl.scrollHeight; }
 
 chatSend.addEventListener("click", sendChat);
-chatInput.addEventListener("keydown", (e)=>{
-  if (e.key === "Enter" && !e.shiftKey){
-    e.preventDefault(); sendChat();
-  }
-});
-
+chatInput.addEventListener("keydown", (e)=>{ if (e.key === "Enter" && !e.shiftKey){ e.preventDefault(); sendChat(); } });
 function sendChat(){
   const txt = fmt(chatInput.value);
   if (!txt || !myRoom || !myName) return;
   socket.emit("chat_send", { room: myRoom, user: myName, text: txt });
   chatInput.value = "";
 }
+socket.on("chat_message", (m)=>{ if (m.room && myRoom && m.room !== myRoom) return; renderChatMessage(m); scrollChatToBottom(); });
 
-socket.on("chat_message", (m)=>{
-  // ignore if not our room
-  if (m.room && myRoom && m.room !== myRoom) return;
-  renderChatMessage(m);
-  scrollChatToBottom();
+// --------------------------- Screenshare UI hint (adds/removes remote screen tile quickly)
+socket.on("screenshare_state", ({room,user,active})=>{
+  if (room !== myRoom) return;
+  const screenName = `${user} (Sharing Screen)`;
+  if (active){ ensureTile(screenName); }
+  else { removeTile(screenName); }
 });
 
-// ---------------------------
-// Share Invite Modal
-// ---------------------------
+// --------------------------- Share Invite Modal
 function openShareModal(){
   const who  = fmt(elName.value) || myName || "Someone";
   const room = fmt(elRoom.value) || myRoom;
@@ -496,9 +517,7 @@ shareCopy.addEventListener("click", async ()=>{
   try{ await navigator.clipboard.writeText(text); toast("Invite copied"); }catch{}
 });
 
-// ---------------------------
-// Query params -> hydrate
-// ---------------------------
+// --------------------------- Query params hydrate
 (function(){
   const p=new URLSearchParams(location.search);
   const qRoom=p.get("room"); const qName=p.get("name");
@@ -506,5 +525,5 @@ shareCopy.addEventListener("click", async ()=>{
   if(qName) elName.value=qName;
 })();
 
-// Initial fetch
+// Initial
 socket.emit("request_rooms");
