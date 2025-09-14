@@ -15,6 +15,7 @@
       <span id="roomTimer" class="timer"></span>
     </div>
     <div class="actions">
+      <button id="btnShareInvite">Share Invite</button>
       <button id="btnMute" disabled>Mute</button>
       <button id="btnCam" disabled>Hide Cam</button>
       <button id="btnShare" disabled>Share Screen</button>
@@ -27,6 +28,7 @@
         <h4>Your Info</h4>
         <input id="displayName" placeholder="e.g. Brad"/>
       </section>
+
       <section>
         <h4>Join a Room</h4>
         <input id="roomInput" placeholder="e.g. pickle"/>
@@ -34,8 +36,11 @@
           <button id="btnJoin">Join</button>
           <button id="btnLeave" disabled>Leave</button>
         </div>
-        <small>Tip: Type any name and press <b>Join</b>. If it doesn’t exist, it’s created.</small>
+        <div class="row" id="conflictRow" style="display:none;">
+          <button id="btnKickGhost" class="danger">Kick Ghost</button>
+        </div>
         <div id="errorBox" class="error" style="display:none;"></div>
+        <small>Tip: Type any name and press <b>Join</b>. If it doesn’t exist, it’s created.</small>
       </section>
 
       <section>
@@ -61,6 +66,8 @@
       </section>
     </main>
   </div>
+
+  <div id="toast" class="toast"></div>
 
   <script src="/static/app.js"></script>
 </body>
