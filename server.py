@@ -15,15 +15,20 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev")
 allowed = os.environ.get("ALLOWED_ORIGINS", "*")
 socketio = SocketIO(app, cors_allowed_origins=allowed, async_mode="eventlet")
 
-# Tunables
-GRACE_SECONDS  = int(os.environ.get("DISCONNECT_GRACE_SECONDS", "8"))  # grace after tab close
-STALE_SECONDS  = int(os.environ.get("DUPLICATE_STALE_SECONDS", "5"))   # treat duplicate as ghost if this stale
+# Tunables (can be overridden via Railway/ENV)
+GRACE_SECONDS  = int(os.environ.get("DISCONNECT_GRACE_SECONDS", "5"))  # remove after brief tab close
+STALE_SECONDS  = int(os.environ.get("DUPLICATE_STALE_SECONDS", "2"))   # consider duplicate "ghost" if > this
+ADMIN_NAME     = os.environ.get("ADMIN_NAME", "hububba").lower()       # admin username (case-insensitive)
 
 # -------------------------------------------------------------------
 # In-memory room state
 # -------------------------------------------------------------------
-rooms = {}      # { room: { "created": ts, "users": { name: {sid, last_seen} } } }
-sid_index = {}  # { sid: { "room": room, "user": name } }
+# rooms = {
+#   room: { "created": ts, "users": { name: {"sid":sid, "last_seen":ts} } }
+# }
+# sid_index = { sid: {"room": room, "user": name} }
+rooms = {}
+sid_index = {}
 
 def now() -> float: return time.time()
 
@@ -42,12 +47,18 @@ def remove_user(room: str, user: str, expect_sid: str | None = None):
     if not u: return
     if expect_sid and u["sid"] != expect_sid: return
     rooms[room]["users"].pop(user, None)
-    # clean sid index
+    # clean sid_index entries for that (room,user)
     for sid, meta in list(sid_index.items()):
         if meta["room"] == room and meta["user"] == user:
             sid_index.pop(sid, None)
     if not rooms[room]["users"]:
         rooms.pop(room, None)
+
+def safe_disconnect(sid: str):
+    try:
+        socketio.server.disconnect(sid)
+    except Exception:
+        pass
 
 def rooms_snapshot():
     t = now()
@@ -59,16 +70,9 @@ def rooms_snapshot():
 def emit_rooms_update():
     socketio.emit("rooms_update", rooms_snapshot())
 
-def safe_disconnect(sid: str):
-    try:
-        socketio.server.disconnect(sid)
-    except Exception:
-        pass
-
 def is_admin_sid(sid: str) -> bool:
     meta = sid_index.get(sid)
-    if not meta: return False
-    return str(meta["user"]).lower() == "hububba"
+    return bool(meta and str(meta["user"]).lower() == ADMIN_NAME)
 
 # -------------------------------------------------------------------
 # HTTP
@@ -102,6 +106,7 @@ def on_request_rooms():
 def on_join(data):
     room = (data or {}).get("room", "").strip()
     user = (data or {}).get("user", "").strip()
+    force = bool((data or {}).get("force", False))
 
     if not room:
         emit("join_error", {"field": "room", "msg": "Room name required"}); return
@@ -113,22 +118,24 @@ def on_join(data):
 
     if existing and existing["sid"] != request.sid:
         age = now() - existing["last_seen"]
-        # AUTO-evict ghosts quickly
-        if age >= STALE_SECONDS:
+        # Fast path: auto-evict ghosts
+        if age >= STALE_SECONDS or force:
             safe_disconnect(existing["sid"])
             remove_user(room, user, expect_sid=existing["sid"])
+            # Tell the old holder they were kicked (if still connected)
+            try:
+                emit("kicked", {"room": room, "by": "system", "reason": "name_taken"}, to=existing["sid"])
+            except Exception:
+                pass
             emit_rooms_update()
         else:
-            # Active conflict
-            emit("join_conflict", {
-                "room": room, "user": user,
-                "msg": "That name is already in this room"
-            })
+            emit("join_conflict", {"room": room, "user": user, "msg": "That name is already in this room"})
             return
 
     join_room(room)
     mark_seen(room, user, request.sid)
 
+    # start mesh
     socketio.emit("ready", {"user": user}, to=room, skip_sid=request.sid)
 
     emit("joined", {
@@ -159,6 +166,11 @@ def on_kick_user(data):
     if not ex:
         emit("kick_result", {"ok": False, "msg": "User not found"}); return
 
+    # Notify the target and disconnect
+    try:
+        emit("kicked", {"room": room, "by": meta["user"], "reason": "admin"}, to=ex["sid"])
+    except Exception:
+        pass
     safe_disconnect(ex["sid"])
     remove_user(room, target, expect_sid=ex["sid"])
     emit_rooms_update()
@@ -194,7 +206,7 @@ def on_disconnect():
             socketio.emit("peer_left", {"user": u}, to=r)
     threading.Thread(target=cleanup, args=(sid,), daemon=True).start()
 
-# ---- Signaling routed by room+username ---------------------------------
+# ---- WebRTC signaling routed by room+username ---------------------------
 def _sid_for(room: str, name: str) -> str | None:
     u = rooms.get(room, {}).get("users", {}).get(name)
     return None if not u else u["sid"]
