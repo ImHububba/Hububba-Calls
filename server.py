@@ -16,8 +16,10 @@ allowed = os.environ.get("ALLOWED_ORIGINS", "*")
 socketio = SocketIO(app, cors_allowed_origins=allowed, async_mode="eventlet")
 
 # Tunables (override via env if you want)
-GRACE_SECONDS  = int(os.environ.get("DISCONNECT_GRACE_SECONDS", "5"))  # remove after brief tab close
-STALE_SECONDS  = int(os.environ.get("DUPLICATE_STALE_SECONDS", "2"))   # consider duplicate "ghost" if > this
+GRACE_SECONDS  = int(os.environ.get("DISCONNECT_GRACE_SECONDS", "5"))   # remove after brief tab close
+STALE_SECONDS  = int(os.environ.get("DUPLICATE_STALE_SECONDS", "2"))    # consider duplicate "ghost" if > this
+CHAT_MAX       = int(os.environ.get("CHAT_MAX", "200"))                 # per-room chat history cap
+CHAT_TRIM_TO   = int(os.environ.get("CHAT_TRIM_TO", "160"))             # trim down to this when exceeding
 
 # -------------------------------------------------------------------
 # In-memory room state
@@ -26,7 +28,8 @@ STALE_SECONDS  = int(os.environ.get("DUPLICATE_STALE_SECONDS", "2"))   # conside
 #   room: {
 #       "created": ts,
 #       "owner": "name" | None,
-#       "users": { name: {"sid":sid, "last_seen":ts, "joined_at":ts} }
+#       "users": { name: {"sid":sid, "last_seen":ts, "joined_at":ts} },
+#       "chat": [ { "ts": ts, "type": "system"|"user", "user": "name"|None, "text": str } ]
 #   }
 # }
 # sid_index = { sid: {"room": room, "user": name} }
@@ -37,7 +40,7 @@ def now() -> float: return time.time()
 
 def ensure_room(room: str):
     if room not in rooms:
-        rooms[room] = {"created": now(), "owner": None, "users": {}}
+        rooms[room] = {"created": now(), "owner": None, "users": {}, "chat": []}
 
 def mark_seen(room: str, user: str, sid: str):
     ensure_room(room)
@@ -100,12 +103,25 @@ def transfer_owner_if_needed(room: str):
     next_owner = min(v["users"].items(), key=lambda kv: kv[1].get("joined_at", now()))[0]
     v["owner"] = next_owner
     socketio.emit("owner_changed", {"room": room, "owner": next_owner}, to=room)
+    add_chat(room, "system", None, f"{next_owner} is now operator")
 
 def is_admin_sid(sid: str) -> bool:
     meta = sid_index.get(sid)
     if not meta: return False
     room, user = meta["room"], meta["user"]
     return rooms.get(room, {}).get("owner") == user
+
+# ---------------- Chat helpers ----------------
+def add_chat(room: str, mtype: str, user: str | None, text: str):
+    """Append a chat message and trim."""
+    if room not in rooms: return
+    text = (text or "")[:500]
+    msg = {"ts": int(now()), "type": mtype, "user": user, "text": text, "room": room}
+    rooms[room]["chat"].append(msg)
+    # Trim if too big
+    if len(rooms[room]["chat"]) > CHAT_MAX:
+        rooms[room]["chat"] = rooms[room]["chat"][-CHAT_TRIM_TO:]
+    return msg
 
 # -------------------------------------------------------------------
 # HTTP
@@ -174,6 +190,10 @@ def on_join(data):
         rooms[room]["owner"] = user
         socketio.emit("owner_changed", {"room": room, "owner": user}, to=room)
 
+    # announce join
+    sysmsg = add_chat(room, "system", None, f"{user} joined")
+    if sysmsg: socketio.emit("chat_message", sysmsg, to=room)
+
     # start mesh for others
     socketio.emit("ready", {"user": user}, to=room, skip_sid=request.sid)
 
@@ -181,7 +201,8 @@ def on_join(data):
         "room": room,
         "created": rooms[room]["created"],
         "users": sorted(list(rooms[room]["users"].keys())),
-        "owner": rooms[room]["owner"]
+        "owner": rooms[room]["owner"],
+        "chat": rooms[room]["chat"][-100:]
     })
     emit_rooms_update()
 
@@ -218,6 +239,9 @@ def on_kick_user(data):
     transfer_owner_if_needed(room)
     emit_rooms_update()
     socketio.emit("peer_left", {"user": target}, to=room)
+    # announce
+    sysmsg = add_chat(room, "system", None, f"{target} was kicked by {meta['user']}")
+    if sysmsg: socketio.emit("chat_message", sysmsg, to=room)
     emit("kick_result", {"ok": True, "target": target})
 
 @socketio.on("leave")
@@ -231,6 +255,8 @@ def on_leave(_data):
     transfer_owner_if_needed(room)
     emit_rooms_update()
     socketio.emit("peer_left", {"user": user}, to=room)
+    sysmsg = add_chat(room, "system", None, f"{user} left")
+    if sysmsg: socketio.emit("chat_message", sysmsg, to=room)
 
 @socketio.on("disconnect")
 def on_disconnect():
@@ -250,6 +276,8 @@ def on_disconnect():
             transfer_owner_if_needed(r)
             emit_rooms_update()
             socketio.emit("peer_left", {"user": u}, to=r)
+            sysmsg = add_chat(r, "system", None, f"{u} left")
+            if sysmsg: socketio.emit("chat_message", sysmsg, to=r)
     threading.Thread(target=cleanup, args=(sid,), daemon=True).start()
 
 # ---- WebRTC signaling routed by room+username ---------------------------
@@ -274,6 +302,21 @@ def on_webrtc_ice(data):
     room, to = data.get("room"), data.get("to")
     sid = _sid_for(room, to) if room and to else None
     if sid: emit("webrtc-ice-candidate", data, to=sid)
+
+# ---------------- Chat events ----------------
+@socketio.on("chat_send")
+def on_chat_send(data):
+    room = (data or {}).get("room", "").strip()
+    user = (data or {}).get("user", "").strip()
+    text = (data or {}).get("text", "")
+    if not room or not user or not text:
+        return
+    # must be a current member
+    if room not in rooms or user not in rooms[room]["users"]:
+        return
+    msg = add_chat(room, "user", user, text)
+    if msg:
+        socketio.emit("chat_message", msg, to=room)
 
 # -------------------------------------------------------------------
 # Entrypoint
