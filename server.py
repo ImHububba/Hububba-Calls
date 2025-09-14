@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 from flask import Flask, send_from_directory, request, jsonify
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
-# NEW: for embed fetching
+# For chat embed fetching
 import requests
 from bs4 import BeautifulSoup
 
@@ -21,23 +21,31 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev")
 allowed = os.environ.get("ALLOWED_ORIGINS", "*")
 socketio = SocketIO(app, cors_allowed_origins=allowed, async_mode="eventlet")
 
-# Tunables
-GRACE_SECONDS  = int(os.environ.get("DISCONNECT_GRACE_SECONDS", "5"))
-STALE_SECONDS  = int(os.environ.get("DUPLICATE_STALE_SECONDS", "2"))
+# ---------------- Tunables ----------------
+GRACE_SECONDS  = int(os.environ.get("DISCONNECT_GRACE_SECONDS", "5"))   # tab-close grace
+STALE_SECONDS  = int(os.environ.get("DUPLICATE_STALE_SECONDS", "2"))    # fast duplicate eviction
 CHAT_MAX       = int(os.environ.get("CHAT_MAX", "200"))
 CHAT_TRIM_TO   = int(os.environ.get("CHAT_TRIM_TO", "160"))
+EMBED_TTL      = int(os.environ.get("EMBED_TTL", "600"))                # seconds
 
-# ---- Simple embed cache ----
+# ---------------- Embed cache ----------------
 EMBED_CACHE = {}
-EMBED_TTL   = int(os.environ.get("EMBED_TTL", "600"))  # 10 minutes
 
-# -------------------------------------------------------------------
-# In-memory room state
-# -------------------------------------------------------------------
+# ---------------- Room state ----------------
+# rooms = {
+#   room: {
+#       "created": ts,
+#       "owner": "name" | None,
+#       "users": { name: {"sid":sid, "last_seen":ts, "joined_at":ts} },
+#       "chat": [ { "ts": ts, "type": "system"|"user", "user": "name"|None, "text": str, "room": room } ]
+#   }
+# }
+# sid_index = { sid: {"room": room, "user": name} }
 rooms = {}
 sid_index = {}
 
-def now() -> float: return time.time()
+def now() -> float:
+    return time.time()
 
 def ensure_room(room: str):
     if room not in rooms:
@@ -55,10 +63,13 @@ def mark_seen(room: str, user: str, sid: str):
     sid_index[sid] = {"room": room, "user": user}
 
 def remove_user(room: str, user: str, expect_sid: str | None = None):
-    if room not in rooms: return
+    if room not in rooms:
+        return
     u = rooms[room]["users"].get(user)
-    if not u: return
-    if expect_sid and u["sid"] != expect_sid: return
+    if not u:
+        return
+    if expect_sid and u["sid"] != expect_sid:
+        return
     rooms[room]["users"].pop(user, None)
     # clean sid index entries for that (room,user)
     for sid, meta in list(sid_index.items()):
@@ -89,10 +100,12 @@ def emit_rooms_update():
     socketio.emit("rooms_update", rooms_snapshot())
 
 def transfer_owner_if_needed(room: str):
-    if room not in rooms: return
+    """If room has no valid owner, promote earliest-joined remaining user."""
+    if room not in rooms:
+        return
     v = rooms[room]
     owner = v.get("owner")
-    if owner and owner in v["users"]:  # still valid
+    if owner and owner in v["users"]:
         return
     if not v["users"]:
         v["owner"] = None
@@ -104,13 +117,15 @@ def transfer_owner_if_needed(room: str):
 
 def is_admin_sid(sid: str) -> bool:
     meta = sid_index.get(sid)
-    if not meta: return False
+    if not meta:
+        return False
     room, user = meta["room"], meta["user"]
     return rooms.get(room, {}).get("owner") == user
 
 # ---------------- Chat helpers ----------------
 def add_chat(room: str, mtype: str, user: str | None, text: str):
-    if room not in rooms: return
+    if room not in rooms:
+        return
     text = (text or "")[:500]
     msg = {"ts": int(now()), "type": mtype, "user": user, "text": text, "room": room}
     rooms[room]["chat"].append(msg)
@@ -118,43 +133,40 @@ def add_chat(room: str, mtype: str, user: str | None, text: str):
         rooms[room]["chat"] = rooms[room]["chat"][-CHAT_TRIM_TO:]
     return msg
 
-# -------------------------------------------------------------------
-# HTTP
-# -------------------------------------------------------------------
+# ---------------- HTTP ----------------
 @app.route("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
 
 @app.route("/health")
-def health(): return "OK", 200
+def health():
+    return "OK", 200
 
-# ---------- NEW: embed preview endpoint ----------
 @app.get("/embed")
 def embed_preview():
     """Return metadata for imhububba links to render chat embeds."""
     url = (request.args.get("url") or "").strip()
     if not url:
         return jsonify({"ok": False, "error": "missing_url"}), 400
-
     try:
         p = urlparse(url)
         if p.scheme not in ("http", "https"):
             return jsonify({"ok": False, "error": "bad_scheme"}), 400
         host = (p.hostname or "").lower()
-        # Restrict to Hububba host(s)
         if not (host.endswith("i.imhububba.com") or host.endswith("imhububba.com")):
             return jsonify({"ok": False, "error": "domain_not_allowed"}), 403
 
         cached = EMBED_CACHE.get(url)
         if cached and (now() - cached["_ts"] < EMBED_TTL):
-            payload = cached.copy(); payload.pop("_ts", None)
+            payload = cached.copy()
+            payload.pop("_ts", None)
             return jsonify({"ok": True, **payload})
 
         sess = requests.Session()
         sess.headers.update({"User-Agent": "HububbaCalls-Embed/1.0"})
         meta = {"source": url, "domain": host}
 
-        # Try HEAD first (for direct images)
+        # HEAD for direct images
         try:
             h = sess.head(url, timeout=4, allow_redirects=True)
         except Exception:
@@ -163,16 +175,13 @@ def embed_preview():
         if h is not None:
             ct = (h.headers.get("content-type") or "").split(";")[0].strip()
             cl = h.headers.get("content-length")
-            size = None
             try:
                 size = int(cl) if cl and cl.isdigit() else None
             except Exception:
                 size = None
 
             meta.update({"content_type": ct, "bytes": size})
-
             if ct.startswith("image/"):
-                # Direct image link; we can embed immediately
                 meta.update({
                     "type": "image",
                     "title": os.path.basename(p.path) or "Image",
@@ -181,7 +190,7 @@ def embed_preview():
                 EMBED_CACHE[url] = {**meta, "_ts": now()}
                 return jsonify({"ok": True, **meta})
 
-        # Otherwise fetch HTML & read OpenGraph
+        # Fetch HTML for OG tags
         try:
             r = sess.get(url, timeout=6)
             html = r.text[:200_000]
@@ -212,9 +221,7 @@ def embed_preview():
     except Exception as e:
         return jsonify({"ok": False, "error": "exception", "detail": str(e)}), 500
 
-# -------------------------------------------------------------------
-# Socket.IO
-# -------------------------------------------------------------------
+# ---------------- Socket.IO ----------------
 @socketio.on("connect")
 def on_connect():
     emit("hello", {"ok": True})
@@ -268,7 +275,8 @@ def on_join(data):
         socketio.emit("owner_changed", {"room": room, "owner": user}, to=room)
 
     sysmsg = add_chat(room, "system", None, f"{user} joined")
-    if sysmsg: socketio.emit("chat_message", sysmsg, to=room)
+    if sysmsg:
+        socketio.emit("chat_message", sysmsg, to=room)
 
     socketio.emit("ready", {"user": user}, to=room, skip_sid=request.sid)
 
@@ -313,14 +321,16 @@ def on_kick_user(data):
     emit_rooms_update()
     socketio.emit("peer_left", {"user": target}, to=room)
     sysmsg = add_chat(room, "system", None, f"{target} was kicked by {meta['user']}")
-    if sysmsg: socketio.emit("chat_message", sysmsg, to=room)
+    if sysmsg:
+        socketio.emit("chat_message", sysmsg, to=room)
     emit("kick_result", {"ok": True, "target": target})
 
 @socketio.on("leave")
 def on_leave(_data):
     sid = request.sid
     meta = sid_index.get(sid)
-    if not meta: return
+    if not meta:
+        return
     room, user = meta["room"], meta["user"]
     leave_room(room)
     remove_user(room, user, expect_sid=sid)
@@ -328,18 +338,22 @@ def on_leave(_data):
     emit_rooms_update()
     socketio.emit("peer_left", {"user": user}, to=room)
     sysmsg = add_chat(room, "system", None, f"{user} left")
-    if sysmsg: socketio.emit("chat_message", sysmsg, to=room)
+    if sysmsg:
+        socketio.emit("chat_message", sysmsg, to=room)
 
 @socketio.on("disconnect")
 def on_disconnect():
     sid = request.sid
     meta = sid_index.get(sid)
-    if not meta: return
+    if not meta:
+        return
     mark_seen(meta["room"], meta["user"], sid)
+
     def cleanup(s):
         time.sleep(GRACE_SECONDS)
         m = sid_index.get(s)
-        if not m: return
+        if not m:
+            return
         r, u = m["room"], m["user"]
         current = rooms.get(r, {}).get("users", {}).get(u)
         if current and now() - current["last_seen"] >= GRACE_SECONDS:
@@ -348,7 +362,8 @@ def on_disconnect():
             emit_rooms_update()
             socketio.emit("peer_left", {"user": u}, to=r)
             sysmsg = add_chat(r, "system", None, f"{u} left")
-            if sysmsg: socketio.emit("chat_message", sysmsg, to=r)
+            if sysmsg:
+                socketio.emit("chat_message", sysmsg, to=r)
     threading.Thread(target=cleanup, args=(sid,), daemon=True).start()
 
 def _sid_for(room: str, name: str) -> str | None:
@@ -359,39 +374,70 @@ def _sid_for(room: str, name: str) -> str | None:
 def on_webrtc_offer(data):
     room, to = data.get("room"), data.get("to")
     sid = _sid_for(room, to) if room and to else None
-    if sid: emit("webrtc-offer", data, to=sid)
+    if sid:
+        emit("webrtc-offer", data, to=sid)
 
 @socketio.on("webrtc-answer")
 def on_webrtc_answer(data):
     room, to = data.get("room"), data.get("to")
     sid = _sid_for(room, to) if room and to else None
-    if sid: emit("webrtc-answer", data, to=sid)
+    if sid:
+        emit("webrtc-answer", data, to=sid)
 
 @socketio.on("webrtc-ice-candidate")
 def on_webrtc_ice(data):
     room, to = data.get("room"), data.get("to")
     sid = _sid_for(room, to) if room and to else None
-    if sid: emit("webrtc-ice-candidate", data, to=sid)
+    if sid:
+        emit("webrtc-ice-candidate", data, to=sid)
 
 @socketio.on("screenshare_state")
 def on_screenshare_state(data):
     room = (data or {}).get("room", "").strip()
     user = (data or {}).get("user", "").strip()
     active = bool((data or {}).get("active", False))
-    if not room or not user: return
-    if room not in rooms or user not in rooms[room]["users"]: return
+    if not room or not user:
+        return
+    if room not in rooms or user not in rooms[room]["users"]:
+        return
     socketio.emit("screenshare_state", {"room": room, "user": user, "active": active}, to=room)
 
-# -------------------------------------------------------------------
-# Entrypoint
-# -------------------------------------------------------------------
+# ----------- MISSING BEFORE: chat_send -----------
+@socketio.on("chat_send")
+def on_chat_send(data):
+    """Broadcast a user chat message to the room and store it."""
+    room = (data or {}).get("room", "").strip()
+    user = (data or {}).get("user", "").strip()
+    text = (data or {}).get("text", "").strip()
+
+    if not room or not user or not text:
+        emit("chat_result", {"ok": False, "msg": "Missing room/user/text"})
+        return
+
+    # validate membership
+    me = sid_index.get(request.sid)
+    if not me or me.get("room") != room or me.get("user") != user:
+        emit("chat_result", {"ok": False, "msg": "Not joined"})
+        return
+
+    msg = add_chat(room, "user", user, text)
+    if msg:
+        socketio.emit("chat_message", msg, to=room)
+        emit("chat_result", {"ok": True})
+    else:
+        emit("chat_result", {"ok": False, "msg": "Room missing"})
+
+# ---------------- Entrypoint ----------------
 def find_open_port(start: int) -> int:
     import socket
     port = start
     while True:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try: s.bind(("0.0.0.0", port))
-            except OSError: port += 1; continue
+            try:
+                s.bind(("0.0.0.0", port))
+            except OSError:
+                port += 1
+                continue
             return port
 
 if __name__ == "__main__":
@@ -399,5 +445,9 @@ if __name__ == "__main__":
     port = req if req > 0 else 5000
     if "PORT" not in os.environ:
         port = find_open_port(port)
-    print("\n" + "="*70 + f"\nHububba Calls\n CORS: {allowed}\n Port: {port}\n" + "="*70 + "\n")
+    print(
+        "\n" + "=" * 70 +
+        f"\nHububba Calls\n CORS: {allowed}\n Port: {port}\n" +
+        "=" * 70 + "\n"
+    )
     socketio.run(app, host="0.0.0.0", port=port)
