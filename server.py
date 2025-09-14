@@ -303,20 +303,15 @@ def on_webrtc_ice(data):
     sid = _sid_for(room, to) if room and to else None
     if sid: emit("webrtc-ice-candidate", data, to=sid)
 
-# ---------------- Chat events ----------------
-@socketio.on("chat_send")
-def on_chat_send(data):
+# ---- Screenshare state (UI hint) -----------------------------------------
+@socketio.on("screenshare_state")
+def on_screenshare_state(data):
     room = (data or {}).get("room", "").strip()
     user = (data or {}).get("user", "").strip()
-    text = (data or {}).get("text", "")
-    if not room or not user or not text:
-        return
-    # must be a current member
-    if room not in rooms or user not in rooms[room]["users"]:
-        return
-    msg = add_chat(room, "user", user, text)
-    if msg:
-        socketio.emit("chat_message", msg, to=room)
+    active = bool((data or {}).get("active", False))
+    if not room or not user: return
+    if room not in rooms or user not in rooms[room]["users"]: return
+    socketio.emit("screenshare_state", {"room": room, "user": user, "active": active}, to=room)
 
 # -------------------------------------------------------------------
 # Entrypoint
