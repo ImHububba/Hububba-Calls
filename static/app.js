@@ -1,11 +1,7 @@
-// ---------------------------
-// Socket connection
-// ---------------------------
+// Socket
 const socket = io({ transports: ["websocket"] });
 
-// ---------------------------
-// UI elements
-// ---------------------------
+// UI
 const elName = document.getElementById("displayName");
 const elRoom = document.getElementById("roomInput");
 const elJoin = document.getElementById("btnJoin");
@@ -13,8 +9,11 @@ const elLeave = document.getElementById("btnLeave");
 const elMute = document.getElementById("btnMute");
 const elCam  = document.getElementById("btnCam");
 const elShare= document.getElementById("btnShare");
+const elShareInvite = document.getElementById("btnShareInvite");
 const elRooms= document.getElementById("roomsList");
 const elErr  = document.getElementById("errorBox");
+const elConflictRow = document.getElementById("conflictRow");
+const elKickGhost = document.getElementById("btnKickGhost");
 
 const elRoomTitle = document.getElementById("roomTitle");
 const elTimer = document.getElementById("roomTimer");
@@ -23,39 +22,46 @@ const localVideo = document.getElementById("localVideo");
 const meName = document.getElementById("meName");
 const peersGrid = document.getElementById("peers");
 
+const toastEl = document.getElementById("toast");
+
+// State
 let myName = "";
 let myRoom = "";
 let roomCreatedTs = 0;
 let timerHandle = null;
+let pendingConflict = null;
 
 let localStream = null;
 let screenStream = null;
 
-// peers: name -> { pc, videoEl }
+// peers: name -> { pc, videoEl, wrap }
 const peers = new Map();
 
 const rtcConfig = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" }
-    // Add TURN servers here later for strict NATs
-  ]
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
 };
 
-// ---------------------------
 // Helpers
-// ---------------------------
-const fmt = (s) => s == null ? "" : String(s).trim();
-const disable = (el, v) => el.disabled = !!v;
+const fmt = (s) => (s == null ? "" : String(s).trim());
+const disable = (el, v) => (el.disabled = !!v);
+
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add("show");
+  setTimeout(() => toastEl.classList.remove("show"), 1400);
+}
 
 function setTimerStart(ts) {
   roomCreatedTs = ts;
   if (timerHandle) clearInterval(timerHandle);
-  timerHandle = setInterval(() => {
+  const tick = () => {
     const elapsed = Math.max(0, Math.floor(Date.now()/1000 - roomCreatedTs));
     const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
     const ss = String(elapsed % 60).padStart(2, "0");
     elTimer.textContent = `• Live ${mm}:${ss}`;
-  }, 1000);
+  };
+  tick();
+  timerHandle = setInterval(tick, 1000);
 }
 
 function showError(msg) {
@@ -99,9 +105,7 @@ function updateButtonsJoined(joined) {
   disable(elShare, !joined);
 }
 
-// ---------------------------
-// Local media: start preview immediately
-// ---------------------------
+// Start preview immediately
 async function startPreview() {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 1280, height: 720 } });
@@ -114,17 +118,14 @@ async function startPreview() {
 startPreview();
 meName.textContent = "(not joined)";
 
-// ---------------------------
 // Join / Leave
-// ---------------------------
 elJoin.addEventListener("click", () => {
   const n = fmt(elName.value);
   const r = fmt(elRoom.value);
   if (!n) return showError("Enter a display name");
   if (!r) return showError("Enter a room name");
-  myName = n; myRoom = r;
-
-  socket.emit("join", { room: myRoom, user: myName });
+  pendingConflict = null;
+  socket.emit("join", { room: r, user: n });
 });
 
 elLeave.addEventListener("click", () => {
@@ -133,7 +134,6 @@ elLeave.addEventListener("click", () => {
 });
 
 function cleanupAfterLeave() {
-  // close peer connections
   for (const [name, obj] of peers.entries()) {
     try { obj.pc && obj.pc.close(); } catch {}
     if (obj.wrap?.parentNode) obj.wrap.parentNode.removeChild(obj.wrap);
@@ -145,23 +145,22 @@ function cleanupAfterLeave() {
   if (timerHandle) { clearInterval(timerHandle); timerHandle = null; }
   updateButtonsJoined(false);
   meName.textContent = "(not joined)";
+  elConflictRow.style.display = "none";
 }
 
-// ---------------------------
 // Mute / Cam / Share
-// ---------------------------
 let audioMuted = false;
 let camHidden = false;
 
 elMute.addEventListener("click", () => {
   audioMuted = !audioMuted;
-  localStream?.getAudioTracks().forEach(t => t.enabled = !audioMuted);
+  localStream?.getAudioTracks().forEach(t => (t.enabled = !audioMuted));
   elMute.textContent = audioMuted ? "Unmute" : "Mute";
 });
 
 elCam.addEventListener("click", () => {
   camHidden = !camHidden;
-  localStream?.getVideoTracks().forEach(t => t.enabled = !camHidden);
+  localStream?.getVideoTracks().forEach(t => (t.enabled = !camHidden));
   elCam.textContent = camHidden ? "Show Cam" : "Hide Cam";
 });
 
@@ -170,14 +169,12 @@ elShare.addEventListener("click", async () => {
   try {
     if (!screenStream) {
       screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-      // replace the video track in every PC
       for (const { pc } of peers.values()) {
         const senders = pc.getSenders().filter(s => s.track && s.track.kind === "video");
         if (senders[0]) senders[0].replaceTrack(screenStream.getVideoTracks()[0]);
       }
       elShare.textContent = "Stop Share";
       screenStream.getVideoTracks()[0].addEventListener("ended", () => {
-        // switch back to camera
         for (const { pc } of peers.values()) {
           const cam = localStream?.getVideoTracks()[0];
           const senders = pc.getSenders().filter(s => s.track && s.track.kind === "video");
@@ -187,7 +184,6 @@ elShare.addEventListener("click", async () => {
         screenStream = null;
       });
     } else {
-      // stop share
       screenStream.getTracks().forEach(t => t.stop());
       screenStream = null;
       elShare.textContent = "Share Screen";
@@ -197,33 +193,26 @@ elShare.addEventListener("click", async () => {
   }
 });
 
-// ---------------------------
-// Heartbeat so server won't kick on brief tab closes
-// ---------------------------
-setInterval(() => socket.emit("heartbeat", {}), 10_000);
+// Heartbeat to keep last_seen fresh
+setInterval(() => socket.emit("heartbeat", {}), 8_000);
 
-// ---------------------------
-// Signaling helpers
-// ---------------------------
+// Signaling
 function makePC(forUser, initiator) {
   const p = new RTCPeerConnection(rtcConfig);
-  // local tracks
   localStream?.getTracks().forEach(t => p.addTrack(t, localStream));
-  // remote track
+
   p.ontrack = (ev) => {
     const v = addPeerCard(forUser);
     if (v.srcObject !== ev.streams[0]) v.srcObject = ev.streams[0];
   };
-  // ICE
   p.onicecandidate = (ev) => {
     if (!ev.candidate) return;
     socket.emit("webrtc-ice-candidate", {
       room: myRoom, from: myName, to: forUser, candidate: ev.candidate
     });
   };
-  // negotiate
+
   if (initiator) {
-    // create offer
     (async () => {
       const desc = await p.createOffer();
       await p.setLocalDescription(desc);
@@ -258,42 +247,59 @@ socket.on("webrtc-ice-candidate", async (data) => {
   const from = data.from;
   const pc = peers.get(from)?.pc;
   if (!pc) return;
-  try {
-    await pc.addIceCandidate(data.candidate);
-  } catch (e) {
-    console.warn("bad ICE candidate", e);
-  }
+  try { await pc.addIceCandidate(data.candidate); } catch {}
 });
 
-// When someone else announces readiness, connect to them as initiator
+// New user ready
 socket.on("ready", ({ user }) => {
   if (!myRoom || !myName || user === myName) return;
   if (!peers.has(user)) addPeerCard(user);
   const pc = peers.get(user).pc || makePC(user, true);
 });
 
-// they left
+// Peer left
 socket.on("peer_left", ({ user }) => {
   removePeerCard(user);
 });
 
-// ---------------------------
-// Server meta events
-// ---------------------------
+// Server meta
 socket.on("joined", (data) => {
+  myName = fmt(elName.value);
   myRoom = data.room;
   elRoomTitle.textContent = `Room: ${myRoom}`;
   meName.textContent = myName;
   setTimerStart(data.created);
-  // draw any already-present users (we'll connect when they send 'ready')
   for (const u of data.users) {
     if (u !== myName) addPeerCard(u);
   }
   updateButtonsJoined(true);
+  elConflictRow.style.display = "none";
 });
 
 socket.on("join_error", (e) => {
   showError(e.msg || "Unable to join");
+});
+
+socket.on("join_conflict", ({ room, user, msg }) => {
+  pendingConflict = { room, user };
+  showError(msg || `Name "${user}" is already in room`);
+  elConflictRow.style.display = "flex";
+});
+
+elKickGhost.addEventListener("click", () => {
+  if (!pendingConflict) return;
+  socket.emit("kick_user", { room: pendingConflict.room, target: pendingConflict.user });
+});
+
+socket.on("kick_result", (res) => {
+  if (res.ok) {
+    toast(`Removed "${res.target}"`);
+    elConflictRow.style.display = "none";
+    // try joining again shortly
+    setTimeout(() => elJoin.click(), 200);
+  } else {
+    showError(res.msg || "Kick failed");
+  }
 });
 
 socket.on("rooms_update", (rooms) => {
@@ -306,5 +312,32 @@ socket.on("rooms_update", (rooms) => {
   });
 });
 
-// initial room list + set preview label
+// Share Invite
+elShareInvite.addEventListener("click", async () => {
+  const r = fmt(elRoom.value) || myRoom || "";
+  if (!r) { showError("Enter a room first"); return; }
+  const url = `${window.location.origin}/?room=${encodeURIComponent(r)}`;
+  const text = `Join me on HububbaCalls in room "${r}" — ${url}`;
+  try {
+    if (navigator.share) {
+      await navigator.share({ title: "HububbaCalls Invite", text, url });
+    } else {
+      await navigator.clipboard.writeText(text);
+      toast("Invite copied");
+    }
+  } catch {
+    try { await navigator.clipboard.writeText(text); toast("Invite copied"); }
+    catch {}
+  }
+});
+
+// Parse ?room=&name= on load
+(function hydrateFromQuery(){
+  const p = new URLSearchParams(window.location.search);
+  const qRoom = p.get("room"); const qName = p.get("name");
+  if (qRoom) elRoom.value = qRoom;
+  if (qName) elName.value = qName;
+})();
+
+// Initial fetch
 socket.emit("request_rooms");
