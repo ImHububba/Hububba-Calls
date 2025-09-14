@@ -36,9 +36,6 @@
           <button id="btnJoin">Join</button>
           <button id="btnLeave" disabled>Leave</button>
         </div>
-        <div class="row" id="conflictRow" style="display:none;">
-          <button id="btnKickGhost" class="danger">Kick Ghost</button>
-        </div>
         <div id="errorBox" class="error" style="display:none;"></div>
         <small>Tip: Type any name and press <b>Join</b>. If it doesn’t exist, it’s created.</small>
       </section>
@@ -65,6 +62,26 @@
         <div id="peers" class="grid"></div>
       </section>
     </main>
+  </div>
+
+  <!-- Share Invite Modal -->
+  <div id="shareModal" class="modal" aria-hidden="true">
+    <div class="modal__backdrop" data-close="1"></div>
+    <div class="modal__body" role="dialog" aria-modal="true">
+      <div class="modal__header">
+        <div class="modal__title">Invite</div>
+        <button class="icon-btn" id="shareClose" title="Close">✕</button>
+      </div>
+      <div class="modal__content">
+        <p><b id="shareWho">Someone</b> invites you to join a room!</p>
+        <div class="codebox">
+          <code id="shareCode">room-code</code>
+        </div>
+      </div>
+      <div class="modal__footer">
+        <button id="shareCopy">Copy</button>
+      </div>
+    </div>
   </div>
 
   <div id="toast" class="toast"></div>
