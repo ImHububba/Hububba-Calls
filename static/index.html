@@ -1,0 +1,124 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Hububba Calls</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+  :root{
+    --bg:#0e1117; --card:#151a23; --muted:#a9b2c2; --text:#eaf0ff;
+    --primary:#6aa2ff; --ok:#2bd27b; --warn:#ffb24e; --bad:#ff6b6b;
+    --line:#22293a; --ring:rgba(106,162,255,.28);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .app{display:grid;grid-template-columns:320px 1fr;min-height:100vh}
+
+  .sidebar{padding:20px;display:flex;flex-direction:column;gap:16px;border-right:1px solid var(--line);background:linear-gradient(180deg,#111522 0%,#0e1117 100%)}
+  .brand{font-size:20px;font-weight:800;letter-spacing:.3px}
+  .brand em{color:var(--primary);font-style:normal}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
+  .card h3{margin:0 0 10px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  .field{display:flex;flex-direction:column;gap:6px;margin:8px 0}
+  .field input{background:#0c1018;border:1px solid #242c3f;border-radius:10px;padding:10px 12px;color:var(--text);outline:none}
+  .field input:focus{border-color:var(--primary);box-shadow:0 0 0 4px var(--ring)}
+  .btnrow{display:flex;gap:8px;flex-wrap:wrap}
+  button{cursor:pointer;border-radius:10px;border:1px solid #242c3f;background:#131828;color:var(--text);padding:10px 12px}
+  button.primary{background:linear-gradient(180deg,var(--primary),#4c78ff);border-color:#365ad1}
+  button.ghost{background:#0c1018;color:var(--muted)}
+  button.pill{border-radius:999px;padding:10px 16px}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .foot{margin-top:auto;font-size:12px;color:#8e97ab}
+
+  .main{display:flex;flex-direction:column}
+  #statusbar{padding:10px 14px;border-bottom:1px solid var(--line);background:#0f131c;font-size:13px;color:var(--muted);display:none}
+  .toolbar{display:flex;gap:10px;padding:14px;border-bottom:1px solid var(--line);background:#0f131c;position:sticky;top:0}
+  .stage{display:grid;grid-template-columns:1fr 420px;gap:16px;padding:16px}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;display:flex;flex-direction:column;gap:12px}
+  .panel h4{margin:0 0 8px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  #localVideo{width:100%;aspect-ratio:16/9;background:#000;border-radius:12px}
+
+  .rooms{display:flex;flex-direction:column;gap:8px;max-height:280px;overflow:auto}
+  .room{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border:1px solid #242c3f;border-radius:10px;background:#0e121c}
+  .room .name{font-weight:700}
+  .room .count{font-size:12px;color:#aab4cf}
+
+  .participants{display:flex;flex-direction:column;gap:8px;max-height:calc(100vh - 220px);overflow:auto}
+  .p-row{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid #242c3f;border-radius:10px;background:#0e121c}
+  .p-row .nm{font-weight:700}
+  .badge{font-size:11px;padding:4px 8px;border-radius:999px;border:1px solid #2a3146;background:#0c1220;color:#adb6d3;margin-left:6px}
+  .badge.mic.on{color:var(--ok);border-color:#174b31;background:#0c1a14}
+  .badge.mic.off{color:var(--bad);border-color:#4b1720;background:#1a0c10}
+  .badge.cam.on{color:#8fe7ff;border-color:#17434d;background:#0c161c}
+  .badge.cam.off{color:#e7c77a;border-color:#4b3b17;background:#1a160c}
+  .video-tile video{width:100%;aspect-ratio:16/9;border-radius:12px;background:#000}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">Hububba<em>Calls</em></div>
+
+      <div class="card">
+        <h3>Your Info</h3>
+        <div class="field">
+          <span>Display name</span>
+          <input id="displayName" placeholder="e.g. Brad">
+        </div>
+        <div class="btnrow">
+          <button id="previewBtn" class="pill">Enable Preview</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Join a Room</h3>
+        <div class="field">
+          <span>Room name</span>
+          <input id="room" placeholder="e.g. pickle">
+        </div>
+        <div class="btnrow">
+          <button id="joinBtn" class="primary">Join</button>
+          <button id="leaveBtn" class="ghost" disabled>Leave</button>
+        </div>
+        <div style="color:#a9b2c2;margin-top:8px;font-size:12px">
+          Tip: Type any name and press <b>Join</b>. If it doesn’t exist, it’s created.
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Rooms (live)</h3>
+        <div id="roomsList" class="rooms"></div>
+      </div>
+
+      <div class="foot">made with ❤️ by you</div>
+    </aside>
+
+    <main class="main">
+      <div id="statusbar"></div>
+
+      <div class="toolbar">
+        <button id="muteBtn" class="pill" disabled>Mute</button>
+        <button id="camBtn" class="pill" disabled>Hide Cam</button>
+        <button id="screenBtn" class="pill" disabled>Share Screen</button>
+      </div>
+
+      <section class="stage">
+        <div class="panel">
+          <h4>YOU</h4>
+          <div class="video-tile"><video id="localVideo" autoplay playsinline muted></video></div>
+        </div>
+
+        <div class="panel">
+          <h4>PARTICIPANTS</h4>
+          <div id="participants" class="participants"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+  <!-- *** FIXED PATH: must be /static/app.js so it loads *** -->
+  <script src="/static/app.js"></script>
+</body>
+</html>
