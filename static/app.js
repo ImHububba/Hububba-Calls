@@ -32,6 +32,11 @@ const meName = document.getElementById("meName");
 const meCard = document.getElementById("meCard");
 const peersGrid = document.getElementById("peers");
 
+// Chat
+const chatEl = document.getElementById("chatMessages");
+const chatInput = document.getElementById("chatInput");
+const chatSend = document.getElementById("chatSend");
+
 // State
 let myName = "";
 let myRoom = "";
@@ -71,6 +76,7 @@ function setTimerStart(ts){
 function updateButtonsJoined(joined){
   disable(elJoin, joined); disable(elLeave, !joined);
   disable(elMute, !joined); disable(elCam,!joined); disable(elShare,!joined);
+  disable(chatInput, !joined); disable(chatSend, !joined);
 }
 
 function applyOpBadge(labelEl, on){
@@ -96,7 +102,6 @@ function renderMeName(){
 function refreshAdminControls(){
   // Toggle kick buttons on peer tiles
   for (const [name,obj] of peers.entries()){
-    // never show kick on yourself
     let btn = obj.wrap.querySelector("button.kick");
     if (isAdmin() && name !== myName){
       if (!btn){
@@ -232,6 +237,7 @@ function cleanupAfterLeave(){
   if (timerHandle){ clearInterval(timerHandle); timerHandle=null; }
   updateButtonsJoined(false); myName=""; renderMeName();
   elConflictRow && (elConflictRow.style.display = "none");
+  chatEl.innerHTML=""; // clear chat
 }
 
 // ---------------------------
@@ -348,6 +354,11 @@ socket.on("joined", (data)=>{
 
   refreshAdminControls();
   socket.emit("request_rooms");
+
+  // load chat history
+  chatEl.innerHTML = "";
+  (data.chat || []).forEach(renderChatMessage);
+  scrollChatToBottom();
 });
 
 socket.on("owner_changed", ({room, owner})=>{
@@ -357,17 +368,16 @@ socket.on("owner_changed", ({room, owner})=>{
   toast(owner ? `Operator: ${owner}` : "No operator");
 });
 
+// conflicts / kicks
 socket.on("join_error", (e)=> showError(e.msg || "Unable to join"));
 socket.on("join_conflict", ({msg})=>{
   showError(msg || "Name already in room");
   elConflictRow && (elConflictRow.style.display = "flex");
 });
-
 socket.on("kick_result", (res)=> {
   if(res.ok){ toast(`Removed "${res.target}"`); socket.emit("request_rooms"); }
   else { showError(res.msg || "Kick failed"); }
 });
-
 socket.on("kicked", (info = {})=>{
   const reason = info.reason === "admin" ? `by ${info.by || "admin"}` : "due to duplicate session";
   showError(`You have been kicked from the room ${reason}.`);
@@ -384,6 +394,79 @@ socket.on("rooms_update", (rooms)=> {
     li.innerHTML = `<b>${r.name}</b> (${r.users.length})${users}`;
     elRooms.appendChild(li);
   });
+});
+
+// ---------------------------
+// Chat UI
+// ---------------------------
+function tsToTime(ts){
+  try{
+    const d = new Date(ts*1000);
+    return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  }catch{ return ""; }
+}
+
+function renderChatMessage(m){
+  const isMe = m.user && myName && m.user === myName;
+  const row = document.createElement("div");
+  row.className = "msg" + (m.type === "system" ? " system" : isMe ? " me" : "");
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+
+  if (m.type === "system"){
+    bubble.textContent = `• ${m.text}`;
+  } else {
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const nameEl = document.createElement("span");
+    nameEl.className = "name";
+    nameEl.textContent = m.user || "unknown";
+    // OP badge next to name if current owner (dynamic)
+    if (currentOwner && m.user === currentOwner){
+      const badge = document.createElement("span");
+      badge.className = "op";
+      badge.textContent = "(OP)";
+      nameEl.appendChild(badge);
+    }
+    const timeEl = document.createElement("span");
+    timeEl.textContent = " • " + tsToTime(m.ts);
+    meta.appendChild(nameEl);
+    meta.appendChild(timeEl);
+
+    const body = document.createElement("div");
+    body.textContent = m.text;
+
+    bubble.appendChild(meta);
+    bubble.appendChild(body);
+  }
+
+  row.appendChild(bubble);
+  chatEl.appendChild(row);
+}
+
+function scrollChatToBottom(){
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+chatSend.addEventListener("click", sendChat);
+chatInput.addEventListener("keydown", (e)=>{
+  if (e.key === "Enter" && !e.shiftKey){
+    e.preventDefault(); sendChat();
+  }
+});
+
+function sendChat(){
+  const txt = fmt(chatInput.value);
+  if (!txt || !myRoom || !myName) return;
+  socket.emit("chat_send", { room: myRoom, user: myName, text: txt });
+  chatInput.value = "";
+}
+
+socket.on("chat_message", (m)=>{
+  // ignore if not our room
+  if (m.room && myRoom && m.room !== myRoom) return;
+  renderChatMessage(m);
+  scrollChatToBottom();
 });
 
 // ---------------------------
