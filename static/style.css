@@ -1,6 +1,6 @@
 :root{
   --bg:#0f141a; --panel:#141b23; --text:#d8e0ea; --muted:#8aa0b6;
-  --brand:#8ac6ff; --accent:#4da3ff; --line:#1f2a38; --danger:#d9534f;
+  --brand:#8ac6ff; --accent:#4da3ff; --line:#1f2a38; --danger:#d9534f; --glow: rgba(77,163,255,.6);
 }
 
 *{box-sizing:border-box}
@@ -39,10 +39,22 @@ button.danger{border-color:#7a2b28; background:#2a1414; color:#ffd6d4}
 .panel{margin-bottom:18px}
 .video-card{
   position:relative; background:#000; border:1px solid var(--line); border-radius:12px; overflow:hidden; aspect-ratio:16/9;
+  transition:border-color .12s ease, box-shadow .12s ease;
+}
+.video-card.speaking{
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent), 0 0 22px var(--glow) inset;
 }
 #localVideo, .peer video{width:100%; height:100%; object-fit:cover; background:#000}
 .grid{display:grid; grid-template-columns:repeat(auto-fill, minmax(240px,1fr)); gap:12px}
-.peer{position:relative; border:1px solid var(--line); border-radius:12px; overflow:hidden; background:#000}
+.peer{
+  position:relative; border:1px solid var(--line); border-radius:12px; overflow:hidden; background:#000;
+  transition:border-color .12s ease, box-shadow .12s ease;
+}
+.peer.speaking{
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent), 0 0 22px var(--glow) inset;
+}
 .name-label{
   position:absolute; left:10px; bottom:10px; padding:4px 8px; border-radius:8px;
   background:rgba(0,0,0,.5); color:#fff; font-weight:600; font-size:12px;
@@ -60,7 +72,7 @@ button.danger{border-color:#7a2b28; background:#2a1414; color:#ffd6d4}
 
 .toast{
   position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
-  background:#16202b; border:1px solid var(--line); color:var(--text);
+  background:#16202b; border:1px solid var(--line); color:#fff;
   padding:10px 14px; border-radius:10px; pointer-events:none; opacity:0; transition:opacity .15s ease;
 }
 .toast.show{opacity:1}
